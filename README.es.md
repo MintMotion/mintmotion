@@ -2,7 +2,7 @@
 
 **Vídeo como fondo de escritorio para Linux Mint y LMDE (Cinnamon).** *by Sombra*
 
-[English version](README.md) · [Guía para desarrolladores (en inglés)](docs/DEVELOPERS.md)
+[English version](README.md) · [Guía para desarrolladores (en inglés)](docs/DEVELOPERS.md) · [▶ Vídeo](https://youtu.be/W-0gZbKyELo)
 
 MintMotion reproduce un vídeo como fondo de escritorio. El vídeo se dibuja dentro
 de la capa de fondo del propio Cinnamon: por debajo de los iconos del escritorio,

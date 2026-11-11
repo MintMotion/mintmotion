@@ -2,7 +2,7 @@
 
 **Video wallpaper for Linux Mint and LMDE (Cinnamon).** *by Sombra*
 
-[Versión en español](README.es.md) · [Developer guide](docs/DEVELOPERS.md)
+[Versión en español](README.es.md) · [Developer guide](docs/DEVELOPERS.md) · [▶ Video](https://youtu.be/W-0gZbKyELo)
 
 MintMotion plays a video as your desktop background. The video is drawn inside
 Cinnamon's own background layer: below the desktop icons, desklets, panels and
