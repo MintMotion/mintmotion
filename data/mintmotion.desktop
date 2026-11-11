@@ -1,0 +1,21 @@
+[Desktop Entry]
+Type=Application
+Name=MintMotion
+GenericName=Video wallpaper
+GenericName[es]=Vídeo como fondo de escritorio
+GenericName[fr]=Fond d’écran vidéo
+GenericName[zh_CN]=视频桌面背景
+Comment=Set a video as the Cinnamon desktop background
+Comment[es]=Elige un vídeo como fondo de escritorio de Cinnamon
+Comment[fr]=Mettre une vidéo en fond d’écran de Cinnamon
+Comment[zh_CN]=将视频设为 Cinnamon 桌面背景
+Exec=mintmotion
+Icon=mintmotion
+Terminal=false
+Categories=Settings;DesktopSettings;GTK;
+Keywords=mintmotion;video;wallpaper;background;desktop;animated;live;
+Keywords[es]=mintmotion;fondo;escritorio;vídeo;video;wallpaper;animado;live;
+Keywords[fr]=mintmotion;vidéo;fond;bureau;wallpaper;animé;live;
+Keywords[zh_CN]=mintmotion;视频;壁纸;桌面;背景;动态;
+OnlyShowIn=X-Cinnamon;
+StartupNotify=true

@@ -1,0 +1,15 @@
+{
+    "uuid": "mintmotion@sombra",
+    "name": "MintMotion",
+    "description": "Plays a video as the desktop background, below the icons and windows. Configured with the MintMotion application. X11 session only.",
+    "version": "1.4.0",
+    "cinnamon-version": [
+        "6.0",
+        "6.2",
+        "6.4",
+        "6.6",
+        "6.8"
+    ],
+    "url": "https://github.com/MintMotion/mintmotion",
+    "author": "Sombra"
+}

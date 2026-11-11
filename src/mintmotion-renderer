@@ -1,0 +1,246 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# MintMotion — renderizador
+# Copyright (C) 2026  José Antonio Ramos Miralles «Sombra» <hola@joseantonioramos.es>
+# Licencia: GPL-3.0-or-later (véase LICENSE)
+#
+# Programa de un solo uso: crea la ventana X11 de tipo escritorio en la que mpv
+# pintará el vídeo, prepara la lista de opciones de mpv adaptada al mpv
+# instalado, lo escribe todo en JSON por la salida estándar y termina.
+#
+# La ventana se crea con «RetainPermanent»: sobrevive al cierre de este
+# proceso, así que no queda ningún proceso de Python residente en memoria. La
+# extensión de Cinnamon lanza y vigila mpv, oculta el actor real de la ventana
+# y lo clona en la capa del fondo de pantalla (por debajo de los iconos de Nemo
+# y de todas las ventanas). Al terminar, la extensión cierra mpv y destruye la
+# ventana.
+#
+# La ventana no tiene color de fondo: cuando mpv se cierra (escritorio tapado
+# mucho rato) conserva el último fotograma, y al volver a abrirlo no hay
+# ningún parpadeo en negro.
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+
+from Xlib import X, Xatom, display
+from Xlib.ext import shape
+
+WM_CLASS = "mintmotion-renderer"
+
+QUALITY = {
+    # Sin escalado (vídeo a la resolución exacta de la pantalla) ninguno cuesta nada.
+    "ahorro": ["--scale=bilinear", "--dscale=bilinear", "--cscale=bilinear",
+               "--correct-downscaling=no", "--linear-downscaling=no",
+               "--sigmoid-upscaling=no", "--dither-depth=no"],
+    "alta": ["--scale=spline36", "--dscale=mitchell", "--cscale=spline36",
+             "--correct-downscaling=yes", "--sigmoid-upscaling=yes",
+             "--dither-depth=auto"],
+    "maxima": ["--scale=ewa_lanczossharp", "--dscale=mitchell",
+               "--cscale=ewa_lanczossharp", "--correct-downscaling=yes",
+               "--linear-downscaling=yes", "--sigmoid-upscaling=yes",
+               "--dither-depth=auto"],
+}
+
+FIT = {
+    "rellenar": ["--keepaspect=yes", "--panscan=1.0"],
+    "ajustar": ["--keepaspect=yes", "--panscan=0.0"],
+    "estirar": ["--keepaspect=no"],
+}
+
+
+def build_mpv_args(args, wid):
+    """Opciones de mpv. La extensión añade --start y --hwdec al lanzarlo."""
+    return [
+        "mpv",
+        "--no-config",                    # ignora mpv.conf/input.conf del usuario
+        f"--wid={wid}",
+        "--vo=gpu,x11",                   # OpenGL; x11 (software) solo si no hay GL
+        "--no-audio",
+        "--sid=no",
+        "--loop-file=inf",
+        "--idle=no",
+        "--osc=no",
+        "--osd-level=0",
+        "--no-input-default-bindings",
+        "--input-vo-keyboard=no",
+        "--input-cursor=no",
+        "--cursor-autohide=no",
+        "--stop-screensaver=no",          # el fondo no debe impedir el salvapantallas
+        "--x11-bypass-compositor=never",
+        # Memoria: el vídeo es un archivo local; no hace falta guardar nada por
+        # delante ni por detrás (el núcleo ya lo tiene en su caché de disco).
+        "--cache=no",
+        "--demuxer-max-bytes=8MiB",
+        "--demuxer-max-back-bytes=0",
+        "--demuxer-readahead-secs=1",
+        "--demuxer-donate-buffer=no",
+        # Nada de scripts ni módulos que no se usan (cada uno ocupa memoria)
+        "--load-scripts=no",
+        "--load-select=no",
+        "--load-console=no",
+        "--load-stats-overlay=no",
+        "--load-auto-profiles=no",
+        "--load-positioning=no",
+        "--ytdl=no",
+        "--framedrop=vo",
+        "--deband=no",
+        "--hdr-compute-peak=no",
+        "--msg-level=all=error",
+        *decoder_threads(args.video),
+        *QUALITY.get(args.quality, QUALITY["alta"]),
+        *FIT.get(args.fit, FIT["rellenar"]),
+        "--",
+        args.video,
+    ]
+
+
+def video_pixels(path):
+    """Ancho × alto del vídeo (ffprobe), o 0 si no se puede saber."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "stream=width,height", "-of", "csv=p=0", path],
+                             capture_output=True, text=True, timeout=10).stdout
+        w, h = (int(x) for x in out.strip().split(",")[:2])
+        return w * h
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return 0
+
+
+def decoder_threads(path):
+    """Hasta 1080p bastan 2 hilos de decodificación por software (medido: sin
+    fotogramas perdidos a 30 y 60 fps) y se ahorra memoria, porque cada hilo
+    guarda sus propios fotogramas. Con más resolución, lo que decida mpv.
+    Solo afecta si el equipo no decodifica por hardware."""
+    px = video_pixels(path)
+    return ["--vd-lavc-threads=2"] if 0 < px <= 1920 * 1088 else []
+
+
+def supported_options():
+    """Nombres de las opciones que entiende el mpv instalado (varían entre versiones)."""
+    try:
+        out = subprocess.run(["mpv", "--no-config", "--list-options"],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    names = set()
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("--"):
+            names.add(line.split()[0][2:])
+    return names or None
+
+
+def filter_options(argv):
+    """Quita las opciones que este mpv no conoce, para que no aborte al arrancar."""
+    known = supported_options()
+    if known is None:
+        return argv
+    essential = {"wid", "loop-file", "no-config"}
+    result = []
+    after_dashdash = False
+    for a in argv:
+        if after_dashdash or a == "mpv" or not a.startswith("--"):
+            result.append(a)
+            continue
+        if a == "--":
+            after_dashdash = True
+            result.append(a)
+            continue
+        name = a[2:].split("=", 1)[0]
+        base = name[3:] if name.startswith("no-") else name
+        if name in known or base in known or name in essential:
+            result.append(a)
+        else:
+            print(f"mintmotion-renderer: mpv no admite --{name}; se omite", file=sys.stderr)
+    return result
+
+
+def create_window(d, width, height, token):
+    screen = d.screen()
+    root = screen.root
+    win = root.create_window(
+        0, 0, width, height, 0,
+        screen.root_depth,
+        X.InputOutput,
+        X.CopyFromParent,
+        background_pixmap=X.NONE,  # sin fondo: conserva el último fotograma
+        event_mask=0,
+    )
+
+    def atom(name):
+        return d.intern_atom(name)
+
+    title = f"MintMotion {token}"  # la extensión reconoce su ventana por la marca
+    win.set_wm_name(title)
+    win.change_property(atom("_NET_WM_NAME"), atom("UTF8_STRING"), 8, title.encode("utf-8"))
+    win.set_wm_class(WM_CLASS, WM_CLASS)
+
+    # Nunca acepta el foco del teclado
+    win.set_wm_hints(flags=1, input=0)  # InputHint, input = False
+    win.set_wm_normal_hints(flags=(1 | 2 | 16 | 32),  # USPosition|USSize|PMinSize|PMaxSize
+                            min_width=width, min_height=height,
+                            max_width=width, max_height=height)
+
+    win.change_property(atom("_NET_WM_WINDOW_TYPE"), Xatom.ATOM, 32,
+                        [atom("_NET_WM_WINDOW_TYPE_DESKTOP")])
+    win.change_property(atom("_NET_WM_STATE"), Xatom.ATOM, 32, [
+        atom("_NET_WM_STATE_STICKY"),
+        atom("_NET_WM_STATE_SKIP_TASKBAR"),
+        atom("_NET_WM_STATE_SKIP_PAGER"),
+        atom("_NET_WM_STATE_BELOW"),
+    ])
+    win.change_property(atom("_NET_WM_DESKTOP"), Xatom.CARDINAL, 32, [0xFFFFFFFF])
+    # 2 = no desviar nunca del compositor: Muffin tiene que poder clonarla siempre
+    win.change_property(atom("_NET_WM_BYPASS_COMPOSITOR"), Xatom.CARDINAL, 32, [2])
+    motif = atom("_MOTIF_WM_HINTS")
+    win.change_property(motif, motif, 32, [2, 0, 0, 0, 0])  # sin decoraciones
+
+    # Región de entrada vacía: los clics y la rueda la atraviesan, y también a
+    # la ventana hija que crea mpv, que queda recortada por la de su padre.
+    win.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, [])
+
+    win.map()
+    d.sync()
+    return win
+
+
+def main():
+    p = argparse.ArgumentParser(description="Crea la ventana de MintMotion y prepara mpv")
+    p.add_argument("--video", required=True)
+    p.add_argument("--width", type=int, required=True)
+    p.add_argument("--height", type=int, required=True)
+    p.add_argument("--token", required=True)
+    p.add_argument("--fit", default="rellenar", choices=sorted(FIT))
+    p.add_argument("--quality", default="alta", choices=sorted(QUALITY))
+    p.add_argument("--print-mpv-args", action="store_true", help=argparse.SUPPRESS)
+    args = p.parse_args()
+
+    if args.print_mpv_args:
+        print("\n".join(filter_options(build_mpv_args(args, 0))))
+        return 0
+
+    if not os.path.isfile(args.video):
+        print(f"mintmotion-renderer: no existe el vídeo: {args.video}", file=sys.stderr)
+        return 2
+
+    d = display.Display()
+    if not d.has_extension("SHAPE"):
+        print("mintmotion-renderer: el servidor X no tiene la extensión SHAPE", file=sys.stderr)
+        return 3
+
+    mpv_argv = filter_options(build_mpv_args(args, 0))
+    # La ventana sobrevive a este proceso; la destruye la extensión al terminar.
+    d.set_close_down_mode(X.RetainPermanent)
+    win = create_window(d, args.width, args.height, args.token)
+    mpv_argv = [f"--wid={win.id}" if a == "--wid=0" else a for a in mpv_argv]
+    d.close()
+    print(json.dumps({"wid": win.id, "argv": mpv_argv}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

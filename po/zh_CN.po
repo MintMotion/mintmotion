@@ -1,0 +1,449 @@
+# Chinese (simplified) translation of MintMotion.
+# Copyright (C) 2026 José Antonio Ramos Miralles
+# This file is distributed under the same license as the mintmotion package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: mintmotion\n"
+"Report-Msgid-Bugs-To: hola@joseantonioramos.es\n"
+"PO-Revision-Date: 2026-11-11 09:00+0100\n"
+"Last-Translator: José Antonio Ramos Miralles <hola@joseantonioramos.es>\n"
+"Language-Team: Chinese (simplified)\n"
+"Language: zh_CN\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Plural-Forms: nplurals=1; plural=0;\n"
+
+#: src/mintmotion:96
+msgid "Fill the screen (crops the excess)"
+msgstr "填满屏幕（裁掉多余部分）"
+
+#: src/mintmotion:97
+msgid "Fit without cropping (black bars)"
+msgstr "完整适应（留黑边）"
+
+#: src/mintmotion:98
+msgid "Stretch (may distort)"
+msgstr "拉伸（可能变形）"
+
+#: src/mintmotion:99
+msgid "High (recommended)"
+msgstr "高（推荐）"
+
+#: src/mintmotion:100
+msgid "Maximum (more work for the GPU)"
+msgstr "最高（GPU 负担更大）"
+
+#: src/mintmotion:101
+msgid "Saver (basic scaling)"
+msgstr "节能（基础缩放）"
+
+#: src/mintmotion:104
+msgid "playing"
+msgstr "播放中"
+
+#: src/mintmotion:104
+msgid "paused"
+msgstr "已暂停"
+
+#: src/mintmotion:104
+msgid "sleeping"
+msgstr "休眠中"
+
+#: src/mintmotion:105
+msgid "error"
+msgstr "错误"
+
+#: src/mintmotion:105
+msgid "stopped"
+msgstr "已停止"
+
+#: src/mintmotion:553
+msgid "Video as desktop background"
+msgstr "将视频设为桌面背景"
+
+#: src/mintmotion:576
+msgid "Choose video…"
+msgstr "选择视频…"
+
+#: src/mintmotion:587
+msgid "Optimize for my screen"
+msgstr "为我的屏幕优化"
+
+#: src/mintmotion:589
+msgid "Creates a copy of the video at the exact resolution of your screen, at 30 fps at most and without sound: maximum sharpness and minimum resource usage. The original is not touched."
+msgstr "按屏幕的精确分辨率生成视频副本，最高 30 帧/秒，不含声音：画面最清晰，资源占用最低。原视频不会被修改。"
+
+#: src/mintmotion:594
+msgid "Cancel"
+msgstr "取消"
+
+#: src/mintmotion:612
+msgid "Screen fit"
+msgstr "屏幕适应方式"
+
+#: src/mintmotion:613
+msgid "Scaling quality"
+msgstr "缩放质量"
+
+#: src/mintmotion:614
+msgid "Pause when the desktop is fully covered"
+msgstr "桌面被完全遮挡时暂停"
+
+#: src/mintmotion:615
+msgid "Hardware decoding"
+msgstr "硬件解码"
+
+#: src/mintmotion:629
+msgid "Resource usage of MintMotion (the mpv player) compared with the whole computer. The work Cinnamon does to show the video happens inside Cinnamon and cannot be separated, so it is not included."
+msgstr "MintMotion（mpv 播放器）的资源占用与整台电脑的对比。Cinnamon 显示视频所做的工作发生在 Cinnamon 内部，无法单独统计，因此不包括在内。"
+
+#: src/mintmotion:658
+msgid "Uninstall…"
+msgstr "卸载…"
+
+#: src/mintmotion:661
+#, python-brace-format
+msgid "Removes {app} and all its settings from the computer. Your videos are not touched."
+msgstr "从电脑中移除 {app} 及其全部设置。不会动你的视频。"
+
+#: src/mintmotion:664
+msgid "Remove video"
+msgstr "移除视频"
+
+#: src/mintmotion:666
+msgid "Stops playing the video and goes back to your static desktop background."
+msgstr "停止播放视频，恢复为静态桌面背景。"
+
+#: src/mintmotion:668
+msgid "Apply"
+msgstr "应用"
+
+#: src/mintmotion:670
+msgid "Sets the video as background with these options."
+msgstr "按这些选项将视频设为背景。"
+
+#: src/mintmotion:680
+#, python-brace-format
+msgid "{app} · by {author}"
+msgstr "{app} · 作者 {author}"
+
+#: src/mintmotion:709
+msgid "You are in a Wayland session. The video background only works in the X11 session of Cinnamon (the default one in Linux Mint and LMDE)."
+msgstr "当前是 Wayland 会话。视频背景只能在 Cinnamon 的 X11 会话中使用（Linux Mint 和 LMDE 的默认会话）。"
+
+#: src/mintmotion:713
+#, python-brace-format
+msgid "{app} needs the Cinnamon desktop."
+msgstr "{app} 需要 Cinnamon 桌面。"
+
+#: src/mintmotion:715
+msgid "mpv is missing: install it with “sudo apt install mpv”."
+msgstr "缺少 mpv：请用“sudo apt install mpv”安装。"
+
+#: src/mintmotion:753
+msgid "_Close"
+msgstr "关闭(_C)"
+
+#: src/mintmotion:764
+msgid "No video selected"
+msgstr "未选择视频"
+
+#: src/mintmotion:772
+msgid "The file no longer exists."
+msgstr "文件已不存在。"
+
+#: src/mintmotion:783
+msgid "Not recognized as a video."
+msgstr "无法识别为视频。"
+
+#: src/mintmotion:802
+#, python-brace-format
+msgid "Ideal for your screen ({w}×{h})."
+msgstr "非常适合你的屏幕（{w}×{h}）。"
+
+#: src/mintmotion:807
+#, python-brace-format
+msgid "your screen is {w}×{h}"
+msgstr "你的屏幕是 {w}×{h}"
+
+#: src/mintmotion:809
+msgid "more than 30 fps costs more without being noticeable in a background"
+msgstr "超过 30 帧/秒会更耗资源，而作为背景看不出区别"
+
+#: src/mintmotion:811
+msgid "H.264 is the format that any graphics card decodes best"
+msgstr "H.264 是所有显卡都解码得最好的格式"
+
+#: src/mintmotion:812
+#, python-brace-format
+msgid "Can be optimized: {reasons}."
+msgstr "可以优化：{reasons}。"
+
+#: src/mintmotion:837
+msgid "Choose a video"
+msgstr "选择视频"
+
+#: src/mintmotion:839 src/mintmotion:902 src/mintmotion:908 src/mintmotion:938
+msgid "_Cancel"
+msgstr "取消(_C)"
+
+#: src/mintmotion:839 src/mintmotion:908
+msgid "_Open"
+msgstr "打开(_O)"
+
+#: src/mintmotion:842
+msgid "Videos"
+msgstr "视频"
+
+#: src/mintmotion:849
+msgid "All files"
+msgstr "所有文件"
+
+#: src/mintmotion:887
+msgid "Cinnamon was not found."
+msgstr "未找到 Cinnamon。"
+
+#: src/mintmotion:888
+#, python-brace-format
+msgid "{app} works as an extension of the Cinnamon desktop."
+msgstr "{app} 以 Cinnamon 桌面扩展的形式运行。"
+
+#: src/mintmotion:900
+msgid "Your previous desktop background no longer exists"
+msgstr "之前的桌面背景已不存在"
+
+#: src/mintmotion:901
+msgid "Choose an image to set as desktop background."
+msgstr "请选择一张图片作为桌面背景。"
+
+#: src/mintmotion:903
+msgid "_Choose image…"
+msgstr "选择图片(_C)…"
+
+#: src/mintmotion:906
+msgid "Choose a background image"
+msgstr "选择背景图片"
+
+#: src/mintmotion:910
+msgid "Images"
+msgstr "图片"
+
+#: src/mintmotion:934
+#, python-brace-format
+msgid "Uninstall {app}?"
+msgstr "要卸载 {app} 吗？"
+
+#: src/mintmotion:935
+msgid "The program, its Cinnamon extension and all its settings will be removed. The desktop will go back to a static background."
+msgstr "将移除本程序、其 Cinnamon 扩展及全部设置。桌面会恢复为静态背景。"
+
+#: src/mintmotion:937
+msgid "Your videos will not be touched."
+msgstr "不会动你的视频。"
+
+#: src/mintmotion:939
+msgid "_Uninstall"
+msgstr "卸载(_U)"
+
+#: src/mintmotion:944
+#, python-brace-format
+msgid "{app} is not installed as a package"
+msgstr "{app} 不是以软件包形式安装的"
+
+#: src/mintmotion:945
+msgid "It seems to be installed from the source code. Uninstall it from that folder with:"
+msgstr "它似乎是从源代码安装的。请在该文件夹中运行以下命令卸载："
+
+#: src/mintmotion:949
+msgid "pkexec is missing"
+msgstr "缺少 pkexec"
+
+#: src/mintmotion:950
+msgid "Without pkexec I cannot ask for your password. Uninstall it from a terminal with:"
+msgstr "没有 pkexec 就无法请求你的密码。请在终端中运行以下命令卸载："
+
+#: src/mintmotion:960
+#, python-brace-format
+msgid "What should I do with the videos that {app} created?"
+msgstr "如何处理 {app} 生成的视频？"
+
+#: src/mintmotion:961
+#, python-brace-format
+msgid "“Optimize for my screen” created <b>{n} video</b> ({size}) in"
+msgid_plural "“Optimize for my screen” created <b>{n} videos</b> ({size}) in"
+msgstr[0] "“为我的屏幕优化”生成了 <b>{n} 个视频</b>（{size}），位于"
+
+#: src/mintmotion:965
+msgid "_Keep them"
+msgstr "保留(_K)"
+
+#: src/mintmotion:966
+msgid "_Delete them"
+msgstr "删除(_D)"
+
+#: src/mintmotion:976
+msgid "Uninstalling… enter your password if asked."
+msgstr "正在卸载… 如有提示请输入密码。"
+
+#: src/mintmotion:995
+msgid "You cancelled the password prompt."
+msgstr "你取消了密码输入。"
+
+#: src/mintmotion:1004
+#, python-brace-format
+msgid "The optimized videos are still in {folder}."
+msgstr "优化后的视频仍在 {folder}。"
+
+#: src/mintmotion:1006
+#, python-brace-format
+msgid "{app} has been uninstalled"
+msgstr "{app} 已卸载"
+
+#: src/mintmotion:1007
+msgid "Nothing of the program remains on the computer."
+msgstr "电脑上已没有本程序的任何残留。"
+
+#: src/mintmotion:1013
+msgid "It was not uninstalled"
+msgstr "未能卸载"
+
+#: src/mintmotion:1024
+msgid "No video: your static desktop background is shown."
+msgstr "无视频：显示的是静态桌面背景。"
+
+#: src/mintmotion:1026
+msgid "Playing on the desktop."
+msgstr "正在桌面上播放。"
+
+#: src/mintmotion:1029
+msgid "Paused: the desktop is covered (it barely uses CPU)."
+msgstr "已暂停：桌面被遮挡（几乎不占用 CPU）。"
+
+#: src/mintmotion:1032
+msgid "Sleeping: the desktop has been covered for a while and the player was closed to free its memory. When uncovered, it continues where it was."
+msgstr "休眠中：桌面已被遮挡一段时间，播放器已关闭以释放内存。桌面重新露出后会从原来的位置继续播放。"
+
+#: src/mintmotion:1036
+msgid "The player has failed several times (check ~/.xsession-errors)."
+msgstr "播放器已多次出错（请查看 ~/.xsession-errors）。"
+
+#: src/mintmotion:1039
+msgid "Starting… (if this does not change, check ~/.xsession-errors)"
+msgstr "正在启动…（如果一直如此，请查看 ~/.xsession-errors）"
+
+#: src/mintmotion:1042
+msgid "There are changes not applied yet: press “Apply”."
+msgstr "有尚未应用的更改：请点击“应用”。"
+
+#: src/mintmotion:1044
+msgid "Press “Apply” to set the video."
+msgstr "点击“应用”即可设置视频。"
+
+#: src/mintmotion:1060
+msgid "measuring…"
+msgstr "测量中…"
+
+#: src/mintmotion:1066
+#, no-python-format, python-brace-format
+msgid "{total}% of total · {core}% of one core ({n} core)"
+msgid_plural "{total}% of total · {core}% of one core ({n} cores)"
+msgstr[0] "占总量 {total}% · 占单核 {core}%（共 {n} 核）"
+
+#: src/mintmotion:1072
+#, no-python-format, python-brace-format
+msgid "{used} of {total} · {pct}%"
+msgstr "{used} / {total} · {pct}%"
+
+#: src/mintmotion:1095 src/mintmotion:1111
+#, no-python-format, python-brace-format
+msgid "Optimizing… {pct}%"
+msgstr "正在优化… {pct}%"
+
+#: src/mintmotion:1128
+msgid "The video could not be optimized."
+msgstr "无法优化该视频。"
+
+#: src/mintmotion:1161
+#, python-brace-format
+msgid "{app}: video as desktop background in Cinnamon. Without arguments it opens the settings window."
+msgstr "{app}：在 Cinnamon 中将视频设为桌面背景。不带参数时打开设置窗口。"
+
+#: src/mintmotion:1163
+msgid "video to use as background (it also enables it)"
+msgstr "用作背景的视频（同时启用）"
+
+#: src/mintmotion:1164
+msgid "screen fit"
+msgstr "屏幕适应方式"
+
+#: src/mintmotion:1165
+msgid "scaling quality"
+msgstr "缩放质量"
+
+#: src/mintmotion:1167
+msgid "pause when the desktop is covered"
+msgstr "桌面被遮挡时暂停"
+
+#: src/mintmotion:1168
+msgid "hardware decoding"
+msgstr "硬件解码"
+
+#: src/mintmotion:1169
+msgid "set the video as background"
+msgstr "将视频设为背景"
+
+#: src/mintmotion:1170
+msgid "remove the video background"
+msgstr "移除视频背景"
+
+#: src/mintmotion:1171
+msgid "show the status"
+msgstr "显示状态"
+
+#: src/mintmotion:1178
+#, python-brace-format
+msgid "could not migrate the previous version: {error}"
+msgstr "无法迁移旧版本：{error}"
+
+#: src/mintmotion:1190
+#, python-brace-format
+msgid "Does not exist: {path}"
+msgstr "不存在：{path}"
+
+#: src/mintmotion:1211
+msgid "Cinnamon was not found (org.cinnamon schema)."
+msgstr "未找到 Cinnamon（org.cinnamon 架构）。"
+
+#: src/mintmotion:1214
+msgid "yes"
+msgstr "是"
+
+#: src/mintmotion:1214
+msgid "no"
+msgstr "否"
+
+#: src/mintmotion:1216
+#, python-brace-format
+msgid "enabled: {value}"
+msgstr "已启用：{value}"
+
+#: src/mintmotion:1217
+#, python-brace-format
+msgid "video: {value}"
+msgstr "视频：{value}"
+
+#: src/mintmotion:1217
+msgid "(none)"
+msgstr "（无）"
+
+#: src/mintmotion:1218
+#, python-brace-format
+msgid "fit: {fit} · quality: {quality} · hardware: {hw} · pause when covered: {pause}"
+msgstr "适应：{fit} · 质量：{quality} · 硬件解码：{hw} · 遮挡时暂停：{pause}"
+
+#: src/mintmotion:1221
+#, python-brace-format
+msgid "state: {value}"
+msgstr "状态：{value}"
