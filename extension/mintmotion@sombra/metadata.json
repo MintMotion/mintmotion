@@ -2,7 +2,7 @@
     "uuid": "mintmotion@sombra",
     "name": "MintMotion",
     "description": "Plays a video as the desktop background, below the icons and windows. Configured with the MintMotion application. X11 session only.",
-    "version": "1.4.0",
+    "version": "1.6.0",
     "cinnamon-version": [
         "6.0",
         "6.2",

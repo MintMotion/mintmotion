@@ -7,9 +7,10 @@
 #   make update-po           añade a los .po los textos nuevos de la plantilla
 # Necesita gettext (msgfmt) para compilar las traducciones.
 
-VERSION  := 1.4.0
+VERSION  := 1.6.0
 UUID     := mintmotion@sombra
 PREFIX   ?= /usr
+SYSCONFDIR ?= /etc
 DESTDIR  ?=
 
 BIN      := $(DESTDIR)$(PREFIX)/bin
@@ -18,6 +19,7 @@ EXTDIR   := $(DESTDIR)$(PREFIX)/share/cinnamon/extensions/$(UUID)
 APPDIR   := $(DESTDIR)$(PREFIX)/share/applications
 ICONDIR  := $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 DOCDIR   := $(DESTDIR)$(PREFIX)/share/doc/mintmotion
+AUTODIR  := $(DESTDIR)$(SYSCONFDIR)/xdg/autostart
 LOCDIR   := $(DESTDIR)$(PREFIX)/share/locale
 LANGS    := $(basename $(notdir $(wildcard po/*.po)))
 MOFILES  := $(foreach l,$(LANGS),build/locale/$(l)/LC_MESSAGES/mintmotion.mo)
@@ -44,10 +46,14 @@ update-po: pot
 install: mo
 	install -Dm755 src/mintmotion $(BIN)/mintmotion
 	install -Dm755 src/mintmotion-renderer $(LIBDIR)/mintmotion-renderer
+	install -Dm755 src/mintmotion-xfce $(LIBDIR)/mintmotion-xfce
 	install -Dm644 extension/$(UUID)/extension.js $(EXTDIR)/extension.js
 	install -Dm644 extension/$(UUID)/metadata.json $(EXTDIR)/metadata.json
 	install -Dm644 data/mintmotion.desktop $(APPDIR)/mintmotion.desktop
 	install -Dm644 data/mintmotion.svg $(ICONDIR)/mintmotion.svg
+	mkdir -p $(AUTODIR)
+	sed 's#@LIBDIR@#$(PREFIX)/lib/mintmotion#g' data/mintmotion-xfce.desktop.in > $(AUTODIR)/mintmotion-xfce.desktop
+	chmod 644 $(AUTODIR)/mintmotion-xfce.desktop
 	install -Dm644 README.md $(DOCDIR)/README.md
 	install -Dm644 README.es.md $(DOCDIR)/README.es.md
 	install -Dm644 docs/DEVELOPERS.md $(DOCDIR)/DEVELOPERS.md
@@ -56,7 +62,9 @@ install: mo
 	-[ -z "$(DESTDIR)" ] && gtk-update-icon-cache -q -t -f $(DESTDIR)$(PREFIX)/share/icons/hicolor || true
 
 uninstall:
+	-pkill -TERM -f '$(PREFIX)/lib/mintmotion/mintmotion-xfce' 2>/dev/null; true
 	rm -f  $(BIN)/mintmotion $(APPDIR)/mintmotion.desktop $(ICONDIR)/mintmotion.svg
+	rm -f  $(AUTODIR)/mintmotion-xfce.desktop
 	rm -rf $(LIBDIR) $(EXTDIR) $(DOCDIR)
 	rm -f $(foreach l,$(LANGS),$(LOCDIR)/$(l)/LC_MESSAGES/mintmotion.mo)
 

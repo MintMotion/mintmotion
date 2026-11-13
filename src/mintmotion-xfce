@@ -1,0 +1,2941 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+#
+# MintMotion — supervisor para Xfce (sesión X11)
+# Copyright (C) 2026  José Antonio Ramos Miralles «Sombra» <hola@joseantonioramos.es>
+# Licencia: GPL-3.0-or-later (véase LICENSE)
+#
+# En Cinnamon el vídeo lo coloca una extensión que vive dentro del propio
+# Cinnamon. Xfce no tiene nada parecido (xfwm4 no admite extensiones), así que
+# ese trabajo lo hace este proceso, que se queda en marcha mientras hay vídeo.
+#
+# Cómo funciona:
+#  1. Crea una ventana X11 por monitor, de tipo escritorio y con el estado
+#     «por debajo» (_NET_WM_STATE_BELOW), sin región de entrada (ratón y
+#     teclado la atraviesan). xfwm4 la coloca en su capa «below»: siempre por
+#     encima de la ventana de xfdesktop (capa «desktop») y siempre por debajo
+#     de los paneles y de todas las demás ventanas. Dentro pinta mpv.
+#  2. La ventana de xfdesktop (fondo + iconos) es opaca, sin canal alfa, tanto
+#     en Xfce 4.18 como en 4.20: no se puede ver nada «a través» de ella. Para
+#     que los iconos sigan viéndose, la ventana del vídeo se recorta (extensión
+#     SHAPE) justo donde xfdesktop pinta algo. Para saber dónde, mientras hay
+#     vídeo el fondo de xfdesktop pasa a ser un color liso «llave» (casi negro)
+#     y se compara el contenido de su ventana con ese color; la extensión
+#     DAMAGE avisa cada vez que xfdesktop repinta. Los ajustes de fondo del
+#     usuario se guardan y se restauran al quitar el vídeo o cerrar la sesión.
+#  3. Pausa el vídeo de un monitor cuando su escritorio queda tapado por
+#     completo, con el salvapantallas activo o con la pantalla apagada. Si
+#     sigue tapado «sleep_after» segundos, cierra mpv y libera su memoria; la
+#     ventana conserva el último fotograma y, al destaparse, mpv vuelve a
+#     abrirse en el mismo punto.
+#  4. Vigila mpv igual que la extensión de Cinnamon: si deja de responder o su
+#     memoria crece de forma anormal, lo reinicia en el mismo punto.
+#
+# Cada monitor tiene su propio mpv: en X11, sin un compositor que lo permita,
+# una ventana no se puede mostrar en dos sitios. A cambio, cada monitor se
+# pausa y entra en reposo por separado.
+#
+# La configuración es la misma que en Cinnamon (~/.config/mintmotion/config.json).
+# El supervisor solo funciona mientras existe ~/.config/mintmotion/xfce-enabled,
+# que crea y borra la aplicación «MintMotion».
+
+import json
+import os
+import re
+import signal
+import socket
+import sys
+import time
+
+import gi
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import GLib, Gio  # noqa: E402
+
+from Xlib import X, Xatom, display, error as xerror  # noqa: E402
+from Xlib.ext import shape  # noqa: E402
+
+WM_CLASS = "mintmotion-renderer"   # la misma clase que la ventana de Cinnamon
+SYSTEM_RENDERER = "/usr/lib/mintmotion/mintmotion-renderer"
+POLL_SECONDS = 2
+RESTART_LIMIT = 3                 # relanzamientos por fallo permitidos...
+RESTART_WINDOW_S = 600            # ...cada 10 minutos
+STARTUP_TIMEOUT_S = 8             # tiempo para que mpv conteste al arrancar
+HEALTH_EVERY_S = 10               # después, una comprobación cada 10 s
+RAM_EVERY_S = 60                  # memoria de mpv: una lectura por minuto
+RAM_BASELINE_AFTER_S = 120        # referencia tomada a los 2 min de arrancar
+RAM_FACTOR = 1.5                  # reinicio si crece un 50 %...
+RAM_MIN_GROWTH_KB = 100 * 1024    # ...y al menos 100 MB
+
+# Color llave del fondo de xfdesktop mientras hay vídeo (rojo, verde, azul).
+# Casi negro, para que los bordes suavizados de iconos y textos queden como
+# una sombra oscura, pero con un valor que ningún icono usa: el negro puro sí
+# aparece en los iconos y dejaría ver el vídeo a través de ellos.
+KEY_RGB = (2, 1, 3)
+STRIP_ROWS = 64                   # la máscara se calcula por franjas de 64 filas
+# Con compositor, los iconos se pintan con su transparencia real en una ventana
+# propia encima del vídeo. La transparencia sale de capturar xfdesktop con el
+# fondo negro y con el fondo blanco (véase «Capa de iconos» más abajo).
+KEY_BLACK = (0, 0, 0)
+KEY_WHITE = (255, 255, 255)
+ALL_KEYS = (KEY_RGB, KEY_BLACK, KEY_WHITE)
+REFINE_QUIET_MS = 150             # sin cambios en el escritorio antes de medir la transparencia
+REFINE_TIMEOUT_S = 1.5            # espera máxima a que xfdesktop repinte con el otro color
+REFINE_BUSY_MS = 1500             # ...o más espera, si se está midiendo demasiado a menudo
+REFINE_RETRIES = 3
+CELL = 64                         # la capa de iconos solo ocupa las celdas donde hay algo
+PUT_BYTES = 240000                # python-xlib no usa BIG-REQUESTS: PutImage en trozos
+MIN_VISIBLE = 0.01                # menos de un 1 % de llave: el fondo no es la llave
+
+DEFAULTS = {
+    "video": "",
+    "fit": "rellenar",          # rellenar | ajustar | estirar
+    "quality": "alta",          # ahorro | alta | maxima
+    "hwdec": True,
+    "pause_when_covered": True,
+    "sleep_after": 120,   # s tapado antes de cerrar mpv (0 = no cerrarlo nunca)
+    "ram_watchdog": True,
+    "ram_limit_mb": 0,    # límite fijo opcional (0 = automático)
+    "gpu_env": True,      # en equipos solo NVIDIA, no cargar los drivers de Mesa
+}
+
+
+def _xdg(var, default):
+    return os.environ.get(var) or os.path.expanduser(default)
+
+
+CONFIG_DIR = os.path.join(_xdg("XDG_CONFIG_HOME", "~/.config"), "mintmotion")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+ENABLED_FILE = os.path.join(CONFIG_DIR, "xfce-enabled")        # lo crea la aplicación
+BACKDROP_FILE = os.path.join(CONFIG_DIR, "xfce-backdrop.json")  # ajustes de fondo guardados
+CACHE_DIR = os.path.join(_xdg("XDG_CACHE_HOME", "~/.cache"), "mintmotion")
+LOG_FILE = os.path.join(CACHE_DIR, "mintmotion.log")
+RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+SOCKET_POINTER = os.path.join(RUNTIME_DIR, "mintmotion.socket")  # un socket de mpv por línea
+STATE_FILE = os.path.join(RUNTIME_DIR, "mintmotion.state")
+PID_FILE = os.path.join(RUNTIME_DIR, "mintmotion-xfce.pid")
+
+_console = None   # salida de error original (el descriptor 2 pasa a ser el registro)
+
+
+def log(msg):
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        print(f"{stamp} {msg}", file=sys.stderr, flush=True)
+    except (OSError, ValueError):
+        pass
+    if _console is not None:
+        try:
+            os.write(_console, f"[mintmotion] {msg}\n".encode("utf-8", "replace"))
+        except OSError:
+            pass
+
+
+DEBUG = bool(os.environ.get("MINTMOTION_DEBUG"))
+
+
+def debug(msg):
+    if DEBUG:
+        log("debug: " + msg)
+
+
+def open_log():
+    """El registro va a ~/.cache/mintmotion/mintmotion.log (también lo que
+    escriba mpv) y, además, a la salida de error de quien nos lanzó."""
+    global _console
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 256 * 1024:
+            with open(LOG_FILE, "rb") as f:
+                f.seek(-64 * 1024, os.SEEK_END)
+                tail = f.read()
+            with open(LOG_FILE, "wb") as f:
+                f.write(tail[tail.find(b"\n") + 1:])
+        fd = os.open(LOG_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    except OSError:
+        return
+    try:
+        _console = os.dup(2)
+    except OSError:
+        _console = None
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+
+
+def read_config():
+    cfg = dict(DEFAULTS)
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            cfg.update(data)
+    except (OSError, ValueError):
+        pass  # sin configuración todavía, o JSON a medio escribir
+    return cfg
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def unlink(path):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def write_atomic(path, text):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def process_pss_kb(pid):
+    """PSS (memoria real, en KB) de un proceso; 0 si no se puede leer."""
+    m = re.search(r"^Pss:\s+(\d+)", read_text(f"/proc/{pid}/smaps_rollup") or "", re.M)
+    return int(m.group(1)) if m else 0
+
+
+_setpriv = False
+
+
+def setpriv_path():
+    """¿setpriv admite --pdeathsig? (util-linux ≥ 2.33). Con él, mpv muere si
+    muere este proceso y nunca quedan reproductores huérfanos."""
+    global _setpriv
+    if _setpriv is False:
+        _setpriv = None
+        path = GLib.find_program_in_path("setpriv")
+        if path:
+            try:
+                p = Gio.Subprocess.new([path, "--pdeathsig", "KILL", "true"],
+                                       Gio.SubprocessFlags.STDOUT_SILENCE | Gio.SubprocessFlags.STDERR_SILENCE)
+                if p.wait(None) and p.get_successful():
+                    _setpriv = path
+            except GLib.Error:
+                pass
+    return _setpriv
+
+
+def nvidia_only_env():
+    """Variables de entorno para mpv solo en equipos con una única GPU y que
+    sea NVIDIA (driver propietario): mpv no carga además los drivers de Mesa.
+    En equipos híbridos, Intel o AMD no se toca nada."""
+    if not os.path.exists("/proc/driver/nvidia/version"):
+        return []
+    vendors = set()
+    try:
+        for name in os.listdir("/sys/class/drm"):
+            if re.fullmatch(r"card\d+", name):
+                v = read_text(f"/sys/class/drm/{name}/device/vendor")
+                if v:
+                    vendors.add(v.strip().lower())
+    except OSError:
+        return []
+    if vendors != {"0x10de"}:
+        return []
+    env = []
+    icd = next((f for f in ("/usr/share/vulkan/icd.d/nvidia_icd.json", "/etc/vulkan/icd.d/nvidia_icd.json")
+                if os.path.exists(f)), None)
+    if icd:
+        env += [("VK_DRIVER_FILES", icd), ("VK_ICD_FILENAMES", icd)]
+    egl = next((f for f in ("/usr/share/glvnd/egl_vendor.d/10_nvidia.json", "/etc/glvnd/egl_vendor.d/10_nvidia.json")
+                if os.path.exists(f)), None)
+    if egl:
+        env.append(("__EGL_VENDOR_LIBRARY_FILENAMES", egl))
+    return env
+
+
+_libc = False
+
+
+def release_memory():
+    """Devuelve al sistema la memoria que queda libre tras calcular una
+    máscara (varios MB de datos temporales que glibc, si no, se guarda)."""
+    global _libc
+    if _libc is False:
+        try:
+            import ctypes
+            _libc = ctypes.CDLL(None)
+            _libc.malloc_trim.argtypes = [ctypes.c_size_t]
+        except (ImportError, OSError, AttributeError):
+            _libc = None
+    if _libc is not None:
+        try:
+            _libc.malloc_trim(0)
+        except Exception:
+            pass
+
+
+def subtract_rect(rects, b):
+    """Resta el rectángulo b = (x, y, w, h) a cada rectángulo de la lista."""
+    out = []
+    bx, by, bw, bh = b
+    bx2, by2 = bx + bw, by + bh
+    for a in rects:
+        ax, ay, aw, ah = a
+        ax2, ay2 = ax + aw, ay + ah
+        if bx >= ax2 or bx2 <= ax or by >= ay2 or by2 <= ay:
+            out.append(a)           # no se tocan
+            continue
+        if by > ay:
+            out.append((ax, ay, aw, by - ay))            # arriba
+        if by2 < ay2:
+            out.append((ax, by2, aw, ay2 - by2))         # abajo
+        top, bottom = max(ay, by), min(ay2, by2)
+        if bx > ax:
+            out.append((ax, top, bx - ax, bottom - top))     # izquierda
+        if bx2 < ax2:
+            out.append((bx2, top, ax2 - bx2, bottom - top))  # derecha
+    return out
+
+
+# ---------------------------------------------------------------------------
+# xfconf (los ajustes de Xfce) por D-Bus, sin dependencias nuevas
+# ---------------------------------------------------------------------------
+
+class Xfconf:
+    NAME = "org.xfce.Xfconf"
+    PATH = "/org/xfce/Xfconf"
+
+    def __init__(self):
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except GLib.Error:
+            self.bus = None
+
+    def _call(self, method, params, reply=None):
+        return self.bus.call_sync(self.NAME, self.PATH, self.NAME, method, params,
+                                  GLib.VariantType(reply) if reply else None,
+                                  Gio.DBusCallFlags.NONE, 3000, None)
+
+    def get_all(self, channel, base):
+        """{propiedad: GLib.Variant}. None si xfconf no está disponible."""
+        if not self.bus:
+            return None
+        try:
+            entries = self._call("GetAllProperties", GLib.Variant("(ss)", (channel, base)),
+                                 "(a{sv})").get_child_value(0)
+        except GLib.Error as e:
+            # canal o propiedad sin crear todavía: xfconf está, pero vacío
+            remote = Gio.DBusError.get_remote_error(e) or ""
+            return {} if remote.startswith("org.xfce.Xfconf.Error.") else None
+        out = {}
+        for i in range(entries.n_children()):
+            entry = entries.get_child_value(i)
+            out[entry.get_child_value(0).get_string()] = entry.get_child_value(1).get_variant()
+        return out
+
+    def get(self, channel, prop):
+        if not self.bus:
+            return None
+        try:
+            return self._call("GetProperty", GLib.Variant("(ss)", (channel, prop)), "(v)") \
+                       .get_child_value(0).get_variant()
+        except GLib.Error:
+            return None
+
+    def set(self, channel, prop, value):
+        try:
+            self._call("SetProperty", GLib.Variant("(ssv)", (channel, prop, value)))
+            return True
+        except GLib.Error as e:
+            log(f"xfconf: could not set {prop}: {e.message}")
+            return False
+
+    def reset(self, channel, prop):
+        try:
+            self._call("ResetProperty", GLib.Variant("(ssb)", (channel, prop, False)))
+        except GLib.Error:
+            pass
+
+
+class Backdrop:
+    """Fondo de xfdesktop. Mientras un monitor tiene vídeo, su fondo es el
+    color llave; los valores del usuario se guardan en xfce-backdrop.json y se
+    devuelven al terminar. El archivo sobrevive a un cierre brusco: si existe
+    al arrancar, lo guardado ahí sigue siendo lo que hay que restaurar."""
+
+    CHANNEL = "xfce4-desktop"
+    PROPS = ("color-style", "image-style", "rgba1")
+    PREFIX_RE = re.compile(r"^(/backdrop/screen\d+/monitor([^/]+)/workspace\d+)/([^/]+)$")
+    # valores por defecto de xfdesktop 4.18 (azul oscuro liso, imagen ampliada)
+    DEFAULTS = {"color-style": GLib.Variant("i", 0), "image-style": GLib.Variant("i", 5),
+                "rgba1": GLib.Variant("av", [GLib.Variant("d", v) for v in (0.08235, 0.13333, 0.2, 1.0)])}
+
+    def __init__(self, xfconf, screen_num=0):
+        self.xfconf = xfconf
+        self.screen_num = screen_num
+        self.broad = False     # aplicar a todos los monitores que conozca xfconf
+        self.key = KEY_RGB     # color llave que se quiere ahora en xfdesktop
+        self.backup = {}       # propiedad -> texto del valor original (None = no existía)
+        try:
+            with open(BACKDROP_FILE, encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                self.backup = data
+        except (OSError, ValueError):
+            pass
+
+    def key_value(self, prop):
+        if prop == "rgba1":
+            return GLib.Variant("av", [GLib.Variant("d", c / 255.0) for c in self.key] +
+                                [GLib.Variant("d", 1.0)])
+        return GLib.Variant("i", 0)   # color liso / sin imagen
+
+    @staticmethod
+    def is_key(prop, value, keys=ALL_KEYS):
+        """¿Es uno de los valores que pone MintMotion (cualquiera de sus colores llave)?"""
+        if value is None:
+            return False
+        try:
+            v = value.unpack()
+        except Exception:
+            return False
+        if prop == "rgba1":
+            return (isinstance(v, (list, tuple)) and len(v) == 4 and
+                    all(isinstance(c, (int, float)) for c in v) and v[3] > 0.999 and
+                    any(all(abs(v[i] - k[i] / 255.0) < 1e-4 for i in range(3)) for k in keys))
+        return v == 0 and not isinstance(v, bool)
+
+    def set_key(self, rgb):
+        """Cambia el color llave en los fondos que ya están intervenidos."""
+        if rgb == self.key:
+            return
+        self.key = rgb
+        if self.xfconf.bus is None:
+            return
+        for path in self.backup:
+            if path.endswith("/rgba1"):
+                self.xfconf.set(self.CHANNEL, path, self.key_value("rgba1"))
+
+    def manages(self, prop):
+        return prop in self.backup
+
+    def _save(self):
+        if self.backup:
+            write_atomic(BACKDROP_FILE, json.dumps(self.backup, indent=1))
+        else:
+            unlink(BACKDROP_FILE)
+
+    def sync(self, names, nworkspaces):
+        """Pone la llave en los monitores «names» (nombres de salida, como los
+        usa xfdesktop) y devuelve su fondo a los demás."""
+        if self.xfconf.bus is None:
+            return False
+        if not names and not self.backup:
+            return True
+        props = self.xfconf.get_all(self.CHANNEL, "/backdrop")
+        if props is None:
+            return False
+        ids = {re.sub(r"\s+", "", n) for n in names if n}
+        everything = bool(names) and (self.broad or len(ids) < len(names))
+        wanted = set()
+        for n in ids:
+            for ws in range(max(nworkspaces, 1)):
+                wanted.add(f"/backdrop/screen{self.screen_num}/monitor{n}/workspace{ws}")
+        for path in props:
+            m = self.PREFIX_RE.match(path)
+            if m and (everything or m.group(2) in ids):
+                wanted.add(m.group(1))
+        changed = False
+        for prefix in sorted(wanted):
+            for prop in self.PROPS:
+                path = f"{prefix}/{prop}"
+                cur = props.get(path)
+                if self.is_key(prop, cur, (self.key,)):
+                    if prop == "rgba1" and path not in self.backup and self.key != KEY_RGB:
+                        # negro o blanco puro pueden ser el color del usuario
+                        self.backup[path] = cur.print_(True)
+                        changed = True
+                    continue
+                if path not in self.backup and not self.is_key(prop, cur, (KEY_RGB,)):
+                    self.backup[path] = cur.print_(True) if cur is not None else None
+                    changed = True
+                self.xfconf.set(self.CHANNEL, path, self.key_value(prop))
+        for path in [p for p in self.backup if p.rsplit("/", 1)[0] not in wanted]:
+            self._restore(path)
+            changed = True
+        if changed:
+            self._save()
+        return True
+
+    def _restore(self, path):
+        text = self.backup.pop(path, None)
+        value = None
+        if text is not None:
+            try:
+                value = GLib.Variant.parse(None, text, None, None)
+            except GLib.Error:
+                value = None
+        if value is not None:
+            self.xfconf.set(self.CHANNEL, path, value)
+        else:
+            # La propiedad no existía. xfdesktop 4.18 no se entera de que se
+            # borra una propiedad y seguiría pintando la llave: primero se le
+            # da su valor por defecto y después se borra.
+            default = self.DEFAULTS.get(path.rsplit("/", 1)[1])
+            if default is not None:
+                self.xfconf.set(self.CHANNEL, path, default)
+            self.xfconf.reset(self.CHANNEL, path)
+
+    def restore_changes(self, workspace=None):
+        """¿Se verá algún cambio al devolver el fondo? (No, si el del usuario
+        es justo el color liso que hay puesto ahora.) Con «workspace», solo se
+        miran los ajustes de ese espacio de trabajo, que es el que se ve."""
+        for path, text in self.backup.items():
+            if workspace is not None and not path.rsplit("/", 1)[0].endswith(f"/workspace{workspace}"):
+                continue
+            if text is None:
+                return True
+            try:
+                value = GLib.Variant.parse(None, text, None, None)
+            except GLib.Error:
+                return True
+            if not self.is_key(path.rsplit("/", 1)[1], value, (self.key,)):
+                return True
+        return False
+
+    def restore_all(self):
+        if not self.backup:
+            return
+        if self.xfconf.bus is None:
+            return
+        # primero los colores y al final el estilo de imagen: un solo repintado visible
+        for path in sorted(self.backup, key=lambda p: p.endswith("/image-style")):
+            self._restore(path)
+        self._save()
+
+    def user_changed(self, prop, value):
+        """El usuario ha cambiado su fondo con el vídeo puesto: ese es ahora
+        el valor que hay que devolver al quitar el vídeo."""
+        self.backup[prop] = value.print_(True)
+        self._save()
+
+
+# ---------------------------------------------------------------------------
+# Comparación de píxeles con el color llave
+# ---------------------------------------------------------------------------
+
+_NONZERO_TO_BIT = bytes.maketrans(b"\x00\x01", b"10")   # igual a la llave -> «1» (se ve el vídeo)
+_NONZERO_TO_FF = bytes([0] + [255] * 255)
+
+
+class KeyMatcher:
+    """Convierte una imagen X11 de 32 bits por píxel en una cadena de «1»
+    (píxel igual a la llave) y «0». Se hace con enteros muy grandes, que
+    Python opera en C: sin bucles por píxel y sin dependencias (numpy…)."""
+
+    def __init__(self, lsb_first):
+        r, g, b = KEY_RGB
+        if lsb_first:
+            self.key, self.mask = bytes((b, g, r, 0)), b"\xff\xff\xff\x00"
+        else:
+            self.key, self.mask = bytes((0, r, g, b)), b"\x00\xff\xff\xff"
+        self._consts = {}
+
+    def bits(self, raw, n):
+        c = self._consts.get(n)
+        if c is None:
+            if len(self._consts) >= 6:
+                self._consts.clear()
+            c = self._consts[n] = (int.from_bytes(self.key * n, "little"),
+                                   int.from_bytes(self.mask * n, "little"),
+                                   int.from_bytes(b"\x01\x00\x00\x00" * n, "little"))
+        key, mask, ones = c
+        x = (int.from_bytes(raw, "little") ^ key) & mask
+        x |= (x >> 8) | (x >> 16) | (x >> 24)   # cualquier diferencia, al primer byte del píxel
+        x |= x >> 4
+        x |= x >> 2
+        x |= x >> 1                              # ...y al primer bit
+        x &= ones
+        return x.to_bytes(n * 4, "little")[0::4].translate(_NONZERO_TO_BIT)
+
+
+def and_bits(a, b):
+    """Y lógico de dos cadenas de «0»/«1» (0x30/0x31) de la misma longitud."""
+    return (int.from_bytes(a, "little") & int.from_bytes(b, "little")).to_bytes(len(a), "little")
+
+
+def pack_bits(bits, width, rows, pad, lsb_first):
+    """Cadena de «0»/«1» (una por píxel) -> mapa de bits X11 de 1 bit por
+    píxel, con cada fila rellenada hasta un múltiplo de 32 bits."""
+    if pad:
+        zeros = b"0" * pad
+        bits = b"".join([bits[r * width:(r + 1) * width] + zeros for r in range(rows)])
+    if lsb_first:
+        return int(bits[::-1], 2).to_bytes(len(bits) // 8, "little")
+    return int(bits, 2).to_bytes(len(bits) // 8, "big")
+
+
+# ---------------------------------------------------------------------------
+# Capa de iconos: transparencia real a partir de dos capturas
+# ---------------------------------------------------------------------------
+#
+# xfdesktop pinta cada píxel como  color·α + fondo·(1 − α).  Con el fondo negro
+# la captura es directamente el color premultiplicado (color·α); con el fondo
+# blanco es eso mismo más 255·(1 − α). Por tanto α = 255 − (blanco − negro), y
+# una ventana ARGB con (negro, α) encima del vídeo da, al componerla, lo mismo
+# que xfdesktop pintaría sobre ese fotograma.
+#
+# Las cuentas se hacen con enteros muy grandes, un canal cada vez y un valor
+# por «carril» de 16 bits, para que sumas y restas no se pisen entre píxeles.
+
+class Lanes:
+    def __init__(self):
+        self._c = {}
+
+    def consts(self, n):
+        c = self._c.get(n)
+        if c is None:
+            if len(self._c) >= 6:
+                self._c.clear()
+            c = self._c[n] = (int.from_bytes(b"\x01\x00" * n, "little"),    # 1 en cada carril
+                              int.from_bytes(b"\xff\x00" * n, "little"),    # 255
+                              int.from_bytes(b"\x00\x01" * n, "little"))    # 256
+        return c
+
+    def clear(self):
+        self._c.clear()
+
+    @staticmethod
+    def load(plane):
+        buf = bytearray(2 * len(plane))
+        buf[0::2] = plane
+        return int.from_bytes(buf, "little")
+
+    @staticmethod
+    def store(v, n):
+        return v.to_bytes(2 * n, "little")[0::2]
+
+
+def lane_satsub(a, b, c):
+    """max(a − b, 0) en cada carril (valores de 0 a 255)."""
+    one, _ff, h = c
+    x = (a | h) - b
+    return x & (((x >> 8) & one) * 255)
+
+
+def lane_max(a, b, c):
+    return b + lane_satsub(a, b, c)
+
+
+def lane_nonzero(a, c):
+    """255 en los carriles distintos de cero (valores de 0 a 255)."""
+    one, ff, _h = c
+    return (((a + ff) >> 8) & one) * 255
+
+
+def alpha_exact(nb, ng, nr, wb, wg, wr, c):
+    """α = 255 − (blanco − negro), con el verde contando doble (si el texto
+    usa suavizado subpíxel, los tres canales no coinciden)."""
+    one, ff, _h = c
+    s = lane_satsub(wr, nr, c) + 2 * lane_satsub(wg, ng, c) + lane_satsub(wb, nb, c) + 2 * one
+    return ff - ((s >> 2) & ff)
+
+
+def alpha_provisional(nb, ng, nr, ob, og, o_r, oa, c):
+    """Mientras no se mide: los píxeles que no cambian conservan su α; los que
+    cambian toman el mayor entre el α que tenían y el mínimo posible para su
+    nuevo color (0 si quedan en negro)."""
+    changed = lane_nonzero((nb ^ ob) | (ng ^ og) | (nr ^ o_r), c)
+    cand = lane_max(oa, lane_max(nb, lane_max(ng, nr, c), c), c) & lane_nonzero(nb | ng | nr, c)
+    return oa ^ ((oa ^ cand) & changed)
+
+
+# ---------------------------------------------------------------------------
+# Comunicación con mpv (socket IPC), sin bloquear
+# ---------------------------------------------------------------------------
+
+def ipc_call(path, command, callback=None, timeout_ms=1000):
+    """Envía una orden a mpv y llama a callback(data, ok); ok es False si
+    falla o si no hay respuesta a tiempo."""
+    state = {"done": False, "watch": 0, "timer": 0, "sock": None, "buf": b""}
+
+    def finish(data, ok, from_watch=False, from_timer=False):
+        if state["done"]:
+            return
+        state["done"] = True
+        if state["watch"] and not from_watch:
+            GLib.source_remove(state["watch"])
+        if state["timer"] and not from_timer:
+            GLib.source_remove(state["timer"])
+        if state["sock"] is not None:
+            try:
+                state["sock"].close()
+            except OSError:
+                pass
+        if callback:
+            callback(data, ok)
+
+    def fail_later():
+        # nunca se llama a callback antes de volver: quien llama no tiene
+        # que contar con que su respuesta llegue «por dentro» de la llamada
+        GLib.timeout_add(0, lambda: finish(None, False) and False)
+
+    if not path:
+        fail_later()
+        return
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        state["sock"] = s
+        s.setblocking(False)
+        s.connect(path)
+        s.send(json.dumps({"command": command}).encode() + b"\n")
+    except OSError:
+        fail_later()
+        return
+
+    def readable(fd, cond):
+        chunk = b""
+        if cond & GLib.IO_IN:
+            try:
+                chunk = s.recv(65536)
+            except BlockingIOError:
+                return True
+            except OSError:
+                chunk = b""
+        if not chunk:
+            finish(None, False, from_watch=True)
+            return False
+        state["buf"] += chunk
+        while b"\n" in state["buf"]:
+            line, state["buf"] = state["buf"].split(b"\n", 1)
+            try:
+                msg = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            if isinstance(msg, dict) and "error" in msg:   # la respuesta (lo demás son eventos)
+                ok = msg["error"] == "success"
+                finish(msg.get("data") if ok else None, ok, from_watch=True)
+                return False
+        return True
+
+    def timed_out():
+        finish(None, False, from_timer=True)
+        return False
+
+    state["watch"] = GLib.io_add_watch(s.fileno(), GLib.PRIORITY_DEFAULT,
+                                       GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, readable)
+    state["timer"] = GLib.timeout_add(timeout_ms, timed_out)
+
+
+# ---------------------------------------------------------------------------
+# Un monitor: su ventana, su mpv y su máscara de iconos
+# ---------------------------------------------------------------------------
+
+class Monitor:
+    __slots__ = ("name", "x", "y", "w", "h")
+
+    def __init__(self, name, x, y, w, h):
+        self.name, self.x, self.y, self.w, self.h = name, x, y, w, h
+
+    @property
+    def rect(self):
+        return (self.x, self.y, self.w, self.h)
+
+
+class Player:
+    def __init__(self, daemon, mon):
+        self.dm = daemon
+        self.mon = mon
+        self.win = None           # ventana X donde pinta mpv
+        self.token = None
+        self.mpv = None           # proceso mpv
+        self.socket = None        # su socket IPC
+        self.gen = 0              # cambia en cada arranque de mpv (descarta respuestas viejas)
+        self.shown = False        # la ventana ya está en pantalla
+        self.settled = False
+        self.failed = False       # mpv ha fallado demasiadas veces
+        self.paused = None
+        self.asleep = False       # mpv cerrado porque el escritorio sigue tapado
+        self.resume_pos = 0.0
+        self.sleep_timer = 0
+        self.hwdec = "no"         # método de decodificación elegido para este vídeo
+        self.hwdec_tried = False
+        self.restart_times = []
+        self.healthy = False
+        self.failures = 0
+        self.mpv_started = 0.0
+        self.ram_baseline = 0
+        # máscara: mapa de bits con «1» donde se ve el vídeo y «0» donde hay icono
+        self.stride = ((mon.w + 31) // 32) * 4
+        self.pixmap = None
+        self.gc = None
+        self.rows = None          # copia local del mapa de bits
+        self.visible = None       # píxeles con vídeo (bits a 1) de la copia local
+        self.sigs = {}            # fila inicial de cada franja -> firma de su última captura
+        self.mask = None          # None (sin poner) | "full" (sin recortes) | "masked"
+        self.dirty = None         # filas (y0, y1) pendientes de recalcular
+        self.stale = False        # hay recortes que quitar cuando mpv vuelva a pintar
+        # capa de iconos (con compositor): ventana ARGB encima de la del vídeo
+        self.ov = None
+        self.ov_gc = None
+        self.argb = None          # su contenido: color premultiplicado + α por píxel
+        self.asigs = {}           # franja -> firma de la última captura en negro
+        self.pending = set()      # franjas cuya transparencia hay que medir
+        self.wshots = {}          # franja -> captura con el fondo blanco
+        self.retries = 0
+        self.base = {}            # franja -> lo de xfdesktop, allí donde otra ventana de escritorio lo tapa
+        self.cells = {}           # franja -> tramos horizontales en los que hay algo que pintar
+        self.shape_dirty = False
+        self.to_paint = []
+
+    # ---------- ventana y proceso mpv ----------
+
+    def start(self):
+        dm = self.dm
+        self.token = f"{time.monotonic_ns() // 1000}-{dm.next_seq()}"
+        self.win = dm.create_video_window(self.mon, self.token)
+        dm.own[self.win.id] = self
+        if dm.alpha:
+            self.make_overlay()
+        self.reset_decoder()
+        self.launch_mpv(0)
+
+    def reset_decoder(self):
+        self.hwdec = "auto-safe" if self.dm.config.get("hwdec") else "no"
+        self.hwdec_tried = False
+
+    def launch_mpv(self, start_pos):
+        dm = self.dm
+        if dm.stopping or not dm.argv or self.win is None or self.mpv is not None:
+            return
+        self.gen += 1
+        self.socket = os.path.join(RUNTIME_DIR, f"mintmotion-{time.monotonic_ns() // 1000}-{dm.next_seq()}.sock")
+        argv = [f"--wid={self.win.id}" if a == "--wid=0" else a for a in dm.argv]
+        extra = [f"--hwdec={self.hwdec}", f"--input-ipc-server={self.socket}"]
+        if start_pos > 0:
+            extra.append(f"--start={start_pos:.3f}")
+        dd = argv.index("--") if "--" in argv else len(argv)
+        argv[dd:dd] = extra
+        sp = setpriv_path()
+        if sp:
+            argv = [sp, "--pdeathsig", "KILL", "--"] + argv
+        launcher = Gio.SubprocessLauncher.new(Gio.SubprocessFlags.NONE)
+        if dm.config.get("gpu_env"):
+            for k, v in nvidia_only_env():
+                launcher.setenv(k, v, True)
+        try:
+            proc = launcher.spawnv(argv)
+        except GLib.Error as e:
+            log(f"could not launch mpv: {e.message}")
+            self.failed = True
+            dm.players_changed()
+            return
+        self.mpv = proc
+        self.mpv_started = time.monotonic()
+        self.healthy = False
+        self.failures = 0
+        self.ram_baseline = 0
+        self.asleep = False
+        sock = self.socket
+        proc.wait_async(None, lambda p, res: dm.guard(self._on_mpv_exit, p, sock))
+        dm.publish()
+        self._wait_frames(self.gen, 0)
+
+    def _on_mpv_exit(self, proc, sock):
+        unlink(sock)
+        if proc is not self.mpv:
+            return  # cierre previsto (dormir, reinicio o parada)
+        self.mpv = None
+        if self.dm.stopping:
+            return
+        log(f"mpv exited unexpectedly ({self.mon.name or 'monitor'})")
+        self._on_failure()
+
+    def _on_failure(self):
+        """Fallo de mpv: se reintenta con límite."""
+        dm = self.dm
+        now = time.monotonic()
+        self.restart_times = [t for t in self.restart_times if now - t < RESTART_WINDOW_S]
+        if len(self.restart_times) >= RESTART_LIMIT:
+            log("mpv failed several times in a row; giving up")
+            self.failed = True
+            self.hide()
+            dm.players_changed()
+            return
+        self.restart_times.append(now)
+        # la ventana sigue: basta con volver a abrir mpv en el mismo punto
+        dm.timeout(1000, self._retry)
+
+    def _retry(self):
+        if self.mpv is None and not self.asleep and not self.failed:
+            self.launch_mpv(self.resume_pos)
+
+    def kill_mpv(self, done=None):
+        """Cierra mpv (SIGTERM y, si no obedece en 3 s, SIGKILL) y llama a «done»."""
+        dm = self.dm
+        proc = self.mpv
+        self.mpv = None
+        if proc is None:
+            if done:
+                done()
+            return
+        finished = []
+
+        def exited(p, res):
+            finished.append(True)
+            if done:
+                dm.guard(done)
+
+        proc.wait_async(None, exited)
+        proc.send_signal(signal.SIGTERM)
+        # Temporizador propio: debe cumplirse aunque el supervisor esté parando.
+        GLib.timeout_add(3000, lambda: (None if finished else proc.force_exit()) and False)
+
+    def ipc(self, command, callback=None, timeout_ms=1000):
+        dm = self.dm
+        cb = (lambda data, ok: dm.guard(callback, data, ok)) if callback else None
+        ipc_call(self.socket if self.mpv is not None else None, command, cb, timeout_ms)
+
+    def relaunch(self, keep_pos=True):
+        """Cierra mpv y lo vuelve a abrir (en el mismo punto, o desde el
+        principio si ha cambiado el vídeo)."""
+        self.cancel_sleep()
+        if self.failed:
+            return
+        if self.mpv is None:
+            if not keep_pos:
+                self.resume_pos = 0.0
+            if not self.asleep or not keep_pos:
+                self.asleep = False
+                self.paused = None
+                self.launch_mpv(self.resume_pos)
+                self.dm.queue_update()
+            return
+        gen = self.gen
+
+        def reopen():
+            if self.dm.stopping or self.mpv is not None or gen != self.gen:
+                return
+            self.launch_mpv(self.resume_pos)
+            self.paused = None   # se reaplica la pausa si hace falta
+            self.dm.queue_update()
+
+        def got_pos(pos, ok):
+            if gen != self.gen:
+                return
+            self.resume_pos = float(pos) if keep_pos and isinstance(pos, (int, float)) else 0.0
+            self.kill_mpv(reopen)
+
+        if keep_pos:
+            self.ipc(["get_property", "time-pos"], got_pos)
+        else:
+            got_pos(None, False)
+
+    # ---------- vigilancia de mpv ----------
+
+    def check_health(self):
+        if self.mpv is None or self.dm.stopping:
+            return
+        gen = self.gen
+
+        def answer(data, ok):
+            if gen != self.gen or self.mpv is None:
+                return
+            if ok:
+                self.failures = 0
+                if not self.healthy:
+                    self.healthy = True
+                    self.check_hwdec()
+                return
+            if not self.healthy:
+                hung = time.monotonic() - self.mpv_started > STARTUP_TIMEOUT_S
+            else:
+                self.failures += 1
+                hung = self.failures >= 2
+            if hung:
+                log("mpv is not responding; restarting it")
+                self.kill_mpv(self._on_failure)
+
+        self.ipc(["get_property", "pid"], answer)
+
+    def check_hwdec(self):
+        """Si mpv decodifica por hardware copiando cada fotograma a la RAM y
+        hay un modo directo, se prueba el directo una vez; si no funciona, se
+        vuelve."""
+        if self.hwdec == "no":
+            return
+        gen = self.gen
+
+        def answer(cur, ok):
+            if gen != self.gen or not ok or not isinstance(cur, str):
+                return
+            if not self.hwdec_tried and cur.endswith("-copy"):
+                self.hwdec_tried = True
+                self.hwdec = cur[:-5]
+                log(f"decoding with {cur}: trying the direct mode {self.hwdec}")
+                self.relaunch()
+            elif self.hwdec_tried and self.hwdec != "auto-safe" and cur in ("no", ""):
+                log(f"direct mode {self.hwdec} does not work; going back to auto-safe")
+                self.hwdec = "auto-safe"
+                self.relaunch()
+
+        self.ipc(["get_property", "hwdec-current"], answer)
+
+    def check_ram(self):
+        cfg = self.dm.config
+        if self.mpv is None or not self.healthy or not cfg.get("ram_watchdog") or self.dm.stopping:
+            return
+        try:
+            pid = int(self.mpv.get_identifier())
+        except (TypeError, ValueError):
+            return
+        pss = process_pss_kb(pid)
+        if not pss:
+            return
+        try:
+            fixed = float(cfg.get("ram_limit_mb") or 0)
+        except (TypeError, ValueError):
+            fixed = 0
+        if fixed > 0:
+            limit = fixed * 1024
+        else:
+            if not self.ram_baseline:
+                if time.monotonic() - self.mpv_started >= RAM_BASELINE_AFTER_S:
+                    self.ram_baseline = pss
+                return
+            limit = max(self.ram_baseline * RAM_FACTOR, self.ram_baseline + RAM_MIN_GROWTH_KB)
+        if pss > limit:
+            log(f"mpv uses {round(pss / 1024)} MB (limit {round(limit / 1024)} MB): restarting it")
+            self.relaunch()
+
+    # ---------- mostrar la ventana ----------
+
+    def _wait_frames(self, gen, tries):
+        """Espera a que mpv ya pinte. La primera vez se muestra entonces la
+        ventana (no tiene fondo y, hasta el primer fotograma, su contenido no
+        está definido); las siguientes se rehace la máscara aplazada."""
+        if gen != self.gen or self.mpv is None or self.dm.stopping:
+            return
+        if self.shown and not self.stale:
+            return
+
+        def answer(n, ok):
+            if gen != self.gen or self.mpv is None or self.dm.stopping:
+                return
+            if (ok and isinstance(n, (int, float)) and n > 1) or tries >= 50:
+                if not self.shown:
+                    self.reveal()
+                elif self.stale:
+                    self.stale = False
+                    self.mark_dirty(0, self.mon.h)
+            else:
+                self.dm.timeout(200, self._wait_frames, gen, tries + 1)
+
+        self.ipc(["get_property", "estimated-frame-number"], answer, 500)
+
+    def reveal(self):
+        dm = self.dm
+        self.shown = True
+        self.failed = False
+        self.mask = None
+        self.dirty = (0, self.mon.h)
+        self.update_mask()
+        self.win.map()
+        if self.ov is not None:
+            self.ov.map()
+        dm.timeout(250, self.settle)   # por si no llega ReparentNotify (sin gestor de ventanas)
+        self.paused = None
+        dm.players_changed()
+
+    def settle(self):
+        """Tras gestionar la ventana, xfwm4 solo aplica la región de entrada
+        vacía a su marco si se la vuelven a poner. Además se baja al fondo de
+        su capa: por encima del escritorio, pero por debajo de otras ventanas
+        «siempre debajo» (conky y similares)."""
+        if self.win is None or not self.shown:
+            return
+        if self.ov is not None:
+            # primero la capa de iconos y después el vídeo: el vídeo queda al
+            # fondo de la capa «below» y los iconos justo encima
+            self.ov.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, [])
+            self.shape_dirty = True
+            self.update_shape()
+            self.ov.configure(stack_mode=X.Below)
+        self.win.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, [])
+        self.win.configure(stack_mode=X.Below)
+        self.settled = True
+
+    def hide(self):
+        if self.win is not None and self.shown:
+            self.win.unmap()
+            if self.ov is not None:
+                self.ov.unmap()
+        self.shown = False
+        self.settled = False
+        self.mask = None
+
+    # ---------- pausa y reposo ----------
+
+    def set_pause(self, pause):
+        if not self.shown or self.failed:
+            return
+        if pause == self.paused:
+            return
+        self.paused = pause
+        if pause:
+            if self.mpv is not None:
+                self.ipc(["set_property", "pause", True])
+            self.schedule_sleep()
+        else:
+            self.cancel_sleep()
+            if self.asleep:
+                # La ventana sigue mostrando el último fotograma: se vuelve a
+                # abrir mpv justo donde se quedó.
+                self.launch_mpv(self.resume_pos)
+            elif self.mpv is not None:
+                def answer(data, ok):
+                    if not ok:
+                        self.paused = None   # se reintenta en la próxima revisión
+                self.ipc(["set_property", "pause", False], answer)
+
+    def schedule_sleep(self):
+        """Escritorio tapado durante «sleep_after» segundos: se cierra mpv y
+        se libera toda su memoria."""
+        try:
+            secs = float(self.dm.config.get("sleep_after") or 0)
+        except (TypeError, ValueError):
+            secs = 0
+        if secs <= 0 or self.sleep_timer or self.asleep or self.mpv is None:
+            return
+        self.sleep_timer = self.dm.timeout(int(secs * 1000), self._sleep_now)
+
+    def _sleep_now(self):
+        self.sleep_timer = 0
+        if not self.paused or self.mpv is None or self.dm.stopping:
+            return
+        gen = self.gen
+
+        def got_pos(pos, ok):
+            if gen != self.gen or not self.paused or self.mpv is None or self.dm.stopping:
+                return
+            self.resume_pos = float(pos) if isinstance(pos, (int, float)) else 0.0
+            self.asleep = True
+            self.kill_mpv(None)
+            self.dm.publish()
+
+        self.ipc(["get_property", "time-pos"], got_pos)
+
+    def cancel_sleep(self):
+        if self.sleep_timer:
+            self.dm.cancel(self.sleep_timer)
+            self.sleep_timer = 0
+
+    def state(self):
+        if self.failed:
+            return "error"
+        if not self.shown:
+            return "arrancando"
+        if self.asleep:
+            return "dormido"
+        if self.paused:
+            return "pausado"
+        return "reproduciendo"
+
+    # ---------- máscara de iconos ----------
+
+    def mark_dirty(self, y0, y1):
+        y0, y1 = max(0, y0), min(self.mon.h, y1)
+        if y1 <= y0:
+            return
+        if self.dirty:
+            y0, y1 = min(y0, self.dirty[0]), max(y1, self.dirty[1])
+        self.dirty = (y0, y1)
+        self.dm.schedule_masks()
+
+    def _set_full(self):
+        if self.mask != "full":
+            self.win.shape_mask(shape.SO.Set, shape.SK.Bounding, 0, 0, X.NONE)
+            self.mask = "full"
+
+    def update_mask(self):
+        """Recalcula las filas pendientes de la máscara y recorta la ventana."""
+        dm = self.dm
+        band, self.dirty = self.dirty, None
+        if self.win is None or not self.shown or band is None:
+            return
+        if self.ov is not None:
+            self._set_full()
+            self.update_alpha(band)
+            return
+        m = self.mon
+        desks = [dw for dw in dm.desks.values() if dw.overlaps(m)]
+        if not dm.can_mask or not desks or dm.hiding:
+            self._set_full()
+            return
+        if self.pixmap is None:
+            self.pixmap = self.win.create_pixmap(m.w, m.h, 1)
+            self.gc = self.pixmap.create_gc(foreground=0, background=0)
+            self.pixmap.fill_rectangle(self.gc, 0, 0, m.w, m.h)
+            self.rows = bytearray(self.stride * m.h)
+        y0 = band[0] - band[0] % STRIP_ROWS
+        y1 = min(m.h, -(-band[1] // STRIP_ROWS) * STRIP_ROWS)
+        pad = self.stride * 8 - m.w
+        only_shrink = self.mpv is None     # nadie repintaría lo que se destape
+        changed = False
+        t0 = time.monotonic()
+        for y in range(y0, y1, STRIP_ROWS):
+            rows = min(STRIP_ROWS, m.h - y)
+            shots = [dw.capture(m, y, rows) for dw in desks]
+            # xfdesktop se repinta entero a menudo (al cambiar el foco, por
+            # ejemplo) sin que cambie nada: si la franja es idéntica a la de
+            # la vez anterior, no hay nada que calcular.
+            sig = tuple(None if sh is None else (sh[0], sh[1], sh[2], sh[3], hash(sh[4])) for sh in shots)
+            if self.sigs.get(y) == sig:
+                continue
+            self.sigs[y] = sig
+            bits = None
+            for shot in shots:
+                if shot is not None:
+                    part = DesktopWindow.key_bits(dm, m, y, rows, shot)
+                    bits = part if bits is None else and_bits(bits, part)
+            del shots
+            if bits is None:
+                bits = b"1" * (m.w * rows)
+            packed = pack_bits(bits, m.w, rows, pad, dm.lsb_first)
+            a, b = y * self.stride, (y + rows) * self.stride
+            old = bytes(self.rows[a:b])
+            if only_shrink and packed != old:
+                shrunk = (int.from_bytes(packed, "little") & int.from_bytes(old, "little")) \
+                    .to_bytes(len(old), "little")
+                if shrunk != packed:
+                    self.stale = True
+                    self.sigs.pop(y, None)   # hay que rehacerla cuando mpv vuelva a pintar
+                packed = shrunk
+            if packed != old:
+                self.rows[a:b] = packed
+                self.pixmap.put_image(self.gc, 0, y, m.w, rows, X.ZPixmap, 1, 0, packed)
+                changed = True
+        if changed or self.visible is None:
+            self.visible = bin(int.from_bytes(self.rows, "little")).count("1")
+        debug(f"mask {m.name}: rows {y0}-{y1} changed={changed} visible={self.visible}/{m.w * m.h} "
+              f"in {(time.monotonic() - t0) * 1000:.0f} ms")
+        if self.visible < MIN_VISIBLE * m.w * m.h:
+            # El fondo de xfdesktop no es la llave (aún no se ha repintado, o
+            # no se ha podido cambiar): el vídeo se ve entero, sin iconos.
+            self._set_full()
+        elif changed or self.mask != "masked":
+            self.win.shape_mask(shape.SO.Set, shape.SK.Bounding, 0, 0, self.pixmap)
+            self.mask = "masked"
+
+    # ---------- capa de iconos con transparencia real ----------
+
+    def make_overlay(self):
+        dm = self.dm
+        m = self.mon
+        if self.ov is not None or self.win is None:
+            return
+        self.ov = dm.create_overlay_window(m, self.token)
+        dm.own[self.ov.id] = self
+        self.ov_gc = self.ov.create_gc()
+        self.argb = bytearray(m.w * m.h * 4)
+        self.asigs, self.pending, self.wshots, self.retries = {}, set(), {}, 0
+        self.base, self.cells, self.to_paint = {}, {}, []
+        self.sigs = {}
+        # de momento no ocupa nada: se le da forma según aparecen los iconos
+        self.shape_dirty = True
+        self.update_shape()
+        if self.shown:
+            self.mask = None
+            self._set_full()
+            self.ov.map()
+            dm.timeout(250, self.settle)
+            self.mark_dirty(0, m.h)
+
+    def drop_overlay(self):
+        ov, self.ov = self.ov, None
+        if ov is None:
+            return
+        self.dm.own.pop(ov.id, None)
+        self.dm.frames.pop(ov.id, None)
+        self.ov_gc = self.argb = None
+        self.asigs, self.pending, self.wshots = {}, set(), {}
+        self.base, self.cells, self.to_paint = {}, {}, []
+        if self.dm.x_ok:
+            ov.destroy()
+
+    def paint(self, y, rows):
+        """Lleva a la ventana las filas [y, y + rows) de la capa de iconos."""
+        if self.ov is None or not self.shown:
+            return
+        w = self.mon.w
+        y, end = max(0, y), min(self.mon.h, y + rows)
+        step = max(1, PUT_BYTES // (w * 4))
+        for yy in range(y, end, step):
+            n = min(step, end - yy)
+            self.ov.put_image(self.ov_gc, 0, yy, w, n, X.ZPixmap, 32, 0,
+                              bytes(self.argb[yy * w * 4:(yy + n) * w * 4]))
+
+    def update_shape(self):
+        """La ventana de los iconos solo ocupa las celdas donde hay algo: así
+        el compositor no tiene que mezclar una capa del tamaño de la pantalla
+        con cada fotograma del vídeo."""
+        if not self.shape_dirty or self.ov is None:
+            return
+        self.shape_dirty = False
+        rects = []
+        for y in sorted(self.cells):
+            rows = self._strip_rows(y)
+            rects += [(x0, y, x1 - x0, rows) for x0, x1 in self.cells[y]]
+        self.ov.shape_rectangles(shape.SO.Set, shape.SK.Bounding, X.Unsorted, 0, 0, rects)
+
+    def flush(self):
+        """Primero la forma (lo que se pinta fuera de ella se pierde) y después el contenido."""
+        self.update_shape()
+        todo, self.to_paint = self.to_paint, []
+        for y, rows in todo:
+            self.paint(y, rows)
+
+    def _strip_rows(self, y):
+        return min(STRIP_ROWS, self.mon.h - y)
+
+    def _strips(self, band):
+        y0 = band[0] - band[0] % STRIP_ROWS
+        y1 = min(self.mon.h, -(-band[1] // STRIP_ROWS) * STRIP_ROWS)
+        return range(y0, y1, STRIP_ROWS)
+
+    def update_alpha(self, band):
+        """Las ventanas de escritorio han repintado: se actualizan las franjas
+        que hayan cambiado (con una transparencia provisional) y se pide medirla."""
+        dm = self.dm
+        m = self.mon
+        if dm.phase or dm.hiding:
+            # midiendo (el fondo puede estar en blanco) o cerrando: después
+            if not dm.hiding:
+                self.dirty = band if self.dirty is None else \
+                    (min(band[0], self.dirty[0]), max(band[1], self.dirty[1]))
+            return
+        has_keyed = any(dw.keyed and dw.overlaps(m) for dw in dm.desks.values())
+        if has_keyed and not dm.keyed():
+            return   # xfdesktop aún no muestra el color llave; avisará al repintar
+        if not has_keyed:
+            self.pending = set()
+        t0 = time.monotonic()
+        n = 0
+        for y in self._strips(band):
+            rows = self._strip_rows(y)
+            raw = dm.capture_strip(m, y, rows, 0) if has_keyed else None
+            if has_keyed and raw is None:
+                continue   # no se ha podido leer: se queda como estaba
+            fshots = dm.capture_foreign(m, y, rows)
+            sig = (None if raw is None else hash(bytes(raw)),
+                   tuple((f[0], f[1], f[2], f[3], hash(f[4])) for f in fshots))
+            old = self.asigs.get(y)
+            if old == sig:
+                # xfdesktop se repinta entero a menudo sin que cambie nada
+                continue
+            kchanged = old is None or old[0] != sig[0]
+            self.asigs[y] = sig
+            self._apply(y, rows, raw, None, fshots, kchanged)
+            if kchanged and raw is not None:
+                self.pending.add(y)   # solo lo de xfdesktop necesita medirse
+            n += 1
+        self.flush()
+        if n:
+            debug(f"icons {m.name}: {n} strips changed in {(time.monotonic() - t0) * 1000:.0f} ms")
+        if self.pending:
+            dm.request_refine()
+
+    def _apply(self, y, rows, raw, white, fshots, kchanged=True):
+        """Nueva franja de la capa: «raw» es lo que pinta xfdesktop sobre
+        negro; «white», lo mismo sobre blanco (si se está midiendo); «fshots»,
+        lo que pintan encima otras ventanas de escritorio."""
+        m = self.mon
+        n = m.w * rows
+        a, b = y * m.w * 4, (y + rows) * m.w * 4
+        cur = self.argb[a:b]
+        base_old = self.base.get(y, cur)
+        if raw is None:
+            base_new = bytearray(n * 4)
+        elif white is None and not kchanged:
+            base_new = base_old
+        else:
+            c = self.dm.lanes.consts(n)
+            load = Lanes.load
+            nb, ng, nr = load(raw[0::4]), load(raw[1::4]), load(raw[2::4])
+            if white is not None:
+                alpha = alpha_exact(nb, ng, nr, load(white[0::4]), load(white[1::4]), load(white[2::4]), c)
+            else:
+                alpha = alpha_provisional(nb, ng, nr, load(base_old[0::4]), load(base_old[1::4]),
+                                          load(base_old[2::4]), load(base_old[3::4]), c)
+            base_new = raw
+            base_new[3::4] = Lanes.store(alpha, n)
+        if fshots:
+            self.base[y] = base_new
+            shown = self._paste_foreign(bytearray(base_new), y, fshots)
+        else:
+            self.base.pop(y, None)
+            shown = base_new
+        if shown != cur:
+            self.argb[a:b] = shown
+            self.to_paint.append((y, rows))
+            self._update_cells(y, rows, shown)
+
+    def _paste_foreign(self, buf, y, fshots):
+        """Otras ventanas de escritorio (conky y similares) van encima de lo
+        de xfdesktop. Las de 32 bits traen su propia transparencia; en las
+        demás, el negro (el fondo de xfdesktop que copian las que se hacen
+        pasar por transparentes) deja ver el vídeo."""
+        m = self.mon
+        for ix0, iy0, iw, ih, fraw, depth in fshots:
+            for r in range(ih):
+                seg = fraw[r * iw * 4:(r + 1) * iw * 4]
+                if depth == 32:
+                    fa = seg[3::4]
+                else:
+                    v = int.from_bytes(seg[0::4], "little") | int.from_bytes(seg[1::4], "little") | \
+                        int.from_bytes(seg[2::4], "little")
+                    fa = v.to_bytes(iw, "little").translate(_NONZERO_TO_FF)
+                    seg = bytearray(seg)
+                    seg[3::4] = fa
+                zeros = fa.count(0)
+                if zeros == iw:
+                    continue
+                o = ((iy0 - m.y - y + r) * m.w + ix0 - m.x) * 4
+                if zeros == 0:
+                    buf[o:o + iw * 4] = seg
+                    continue
+                nz = fa.translate(_NONZERO_TO_FF)
+                mk = bytearray(iw * 4)
+                mk[0::4] = mk[1::4] = mk[2::4] = mk[3::4] = nz
+                mi = int.from_bytes(mk, "little")
+                old = int.from_bytes(buf[o:o + iw * 4], "little")
+                buf[o:o + iw * 4] = (old ^ ((old ^ int.from_bytes(seg, "little")) & mi)).to_bytes(iw * 4, "little")
+        return buf
+
+    def _update_cells(self, y, rows, shown):
+        """Tramos horizontales de la franja en los que algún píxel no es transparente."""
+        w = self.mon.w
+        ap = bytes(shown[3::4])
+        runs = []
+        if ap.count(0) != len(ap):
+            col = 0
+            for r in range(rows):
+                col |= int.from_bytes(ap[r * w:(r + 1) * w], "little")
+            cb = col.to_bytes(w, "little")
+            for x in range(0, w, CELL):
+                x1 = min(w, x + CELL)
+                if cb.count(0, x, x1) != x1 - x:
+                    if runs and runs[-1][1] == x:
+                        runs[-1][1] = x1
+                    else:
+                        runs.append([x, x1])
+        runs = tuple((x0, x1) for x0, x1 in runs)
+        if self.cells.get(y, ()) != runs:
+            self.cells[y] = runs
+            self.shape_dirty = True
+
+    def capture_white(self):
+        dm = self.dm
+        self.wshots = {y: dm.capture_strip(self.mon, y, self._strip_rows(y), 255)
+                       for y in sorted(self.pending)}
+
+    def finish_refine(self):
+        """El fondo vuelve a estar en negro: con la captura en blanco de antes
+        y una nueva en negro sale la transparencia exacta de cada franja."""
+        dm = self.dm
+        ws, self.wshots = self.wshots, {}
+        again = set()
+        for y, white in ws.items():
+            rows = self._strip_rows(y)
+            raw = dm.capture_strip(self.mon, y, rows, 0)
+            if raw is None or white is None or len(white) != len(raw):
+                continue
+            fshots = dm.capture_foreign(self.mon, y, rows)
+            sig = (hash(bytes(raw)), tuple((f[0], f[1], f[2], f[3], hash(f[4])) for f in fshots))
+            old = self.asigs.get(y)
+            if old is None or old[0] != sig[0]:
+                again.add(y)     # cambió mientras se medía: se repite
+            self.asigs[y] = sig
+            self._apply(y, rows, raw, white, fshots)
+        self.flush()
+        if again and self.retries < REFINE_RETRIES:
+            self.retries += 1
+            self.pending = again
+        else:
+            self.retries = 0
+            self.pending = set()
+
+    # ---------- cierre ----------
+
+    def destroy(self):
+        dm = self.dm
+        self.gen += 1
+        self.cancel_sleep()
+        win, self.win = self.win, None
+        if win is None:
+            return
+        self.drop_overlay()
+        dm.own.pop(win.id, None)
+        dm.frames.pop(win.id, None)
+        if self.shown:
+            win.unmap()
+        self.shown = False
+        pixmap, gc, self.pixmap, self.gc, self.rows = self.pixmap, self.gc, None, None, None
+        self.visible = None
+        self.sigs = {}
+
+        def gone():
+            # la ventana se destruye cuando mpv ya no pinta en ella
+            if dm.x_ok:
+                if gc is not None:
+                    gc.free()
+                if pixmap is not None:
+                    pixmap.free()
+                win.destroy()
+
+        self.kill_mpv(gone)
+
+
+class DesktopWindow:
+    """Ventana de tipo escritorio de otro programa (xfdesktop): lo que pinte
+    distinto del color llave tiene que verse por encima del vídeo."""
+
+    def __init__(self, win):
+        self.win = win
+        self.damage = None
+        self.rect = None      # (x, y, w, h) en coordenadas de la pantalla
+        self.keyed = True     # es de xfdesktop: su fondo es el color llave
+        self.depth = 24
+
+    def overlaps(self, m):
+        if not self.rect:
+            return False
+        x, y, w, h = self.rect
+        return x < m.x + m.w and x + w > m.x and y < m.y + m.h and y + h > m.y
+
+    def capture(self, m, y, rows):
+        """Píxeles de esta ventana en la franja [y, y + rows) del monitor m:
+        (x0, y0, ancho, alto, datos) en coordenadas de pantalla, o None si no
+        la toca o no se puede leer."""
+        x, wy, w, h = self.rect
+        ix0, ix1 = max(m.x, x), min(m.x + m.w, x + w)
+        iy0, iy1 = max(m.y + y, wy), min(m.y + y + rows, wy + h)
+        if ix1 <= ix0 or iy1 <= iy0:
+            return None
+        iw, ih = ix1 - ix0, iy1 - iy0
+        try:
+            raw = self.win.get_image(ix0 - x, iy0 - wy, iw, ih, X.ZPixmap, 0xffffffff).data
+        except xerror.XError:
+            return None
+        if len(raw) != iw * ih * 4:
+            return None
+        return (ix0, iy0, iw, ih, raw)
+
+    @staticmethod
+    def key_bits(dm, m, y, rows, shot):
+        """Cadena de «1»/«0» de la franja: «1» donde la captura muestra la
+        llave o no llega."""
+        ix0, iy0, iw, ih, raw = shot
+        ix1, iy1 = ix0 + iw, iy0 + ih
+        bits = dm.matcher.bits(raw, iw * ih)
+        if iw == m.w and ih == rows:
+            return bits
+        left, right = b"1" * (ix0 - m.x), b"1" * (m.x + m.w - ix1)
+        full = b"1" * m.w
+        out = [full] * (iy0 - (m.y + y))
+        out += [left + bits[r * iw:(r + 1) * iw] + right for r in range(ih)]
+        out += [full] * (m.y + y + rows - iy1)
+        return b"".join(out)
+
+
+class WinInfo:
+    """Lo que hace falta saber de una ventana gestionada para decidir si
+    tapa el escritorio. Se relee solo cuando cambia alguna propiedad."""
+    __slots__ = ("win", "type", "state", "desktop", "opacity", "strut", "gtk", "dirty")
+
+    def __init__(self, win):
+        self.win = win
+        self.type = None
+        self.state = frozenset()
+        self.desktop = None
+        self.opacity = 0xFFFFFFFF
+        self.strut = None
+        self.gtk = None
+        self.dirty = True
+
+
+# ---------------------------------------------------------------------------
+# El supervisor
+# ---------------------------------------------------------------------------
+
+class Daemon:
+    ATOMS = ("XFCE_DESKTOP_WINDOW", "_NET_CLIENT_LIST", "_NET_CLIENT_LIST_STACKING", "_NET_CURRENT_DESKTOP",
+             "_NET_NUMBER_OF_DESKTOPS", "_NET_ACTIVE_WINDOW", "_NET_SHOWING_DESKTOP",
+             "_NET_SUPPORTING_WM_CHECK", "_NET_WM_WINDOW_TYPE", "_NET_WM_WINDOW_TYPE_DESKTOP",
+             "_NET_WM_WINDOW_TYPE_DOCK", "_NET_WM_WINDOW_TYPE_NORMAL", "_NET_WM_WINDOW_TYPE_DIALOG",
+             "_NET_WM_WINDOW_TYPE_UTILITY", "_NET_WM_STATE", "_NET_WM_STATE_HIDDEN",
+             "_NET_WM_STATE_SHADED", "_NET_WM_STATE_FULLSCREEN", "_NET_WM_STATE_STICKY",
+             "_NET_WM_STATE_SKIP_TASKBAR", "_NET_WM_STATE_SKIP_PAGER", "_NET_WM_STATE_BELOW",
+             "_NET_WM_DESKTOP", "_NET_WM_WINDOW_OPACITY",
+             "_NET_WM_STRUT", "_NET_WM_STRUT_PARTIAL", "_GTK_FRAME_EXTENTS",
+             "_NET_WM_BYPASS_COMPOSITOR", "_MOTIF_WM_HINTS", "_NET_WM_NAME", "UTF8_STRING")
+
+    def __init__(self):
+        self.d = display.Display()
+        self.x_ok = True
+        self.screen_num = self.d.get_default_screen()
+        self.screen = self.d.screen()
+        self.root = self.screen.root
+        self.d.set_error_handler(self._x_error)
+        if not self.d.has_extension("SHAPE"):
+            raise SystemExit("mintmotion: the X server has no SHAPE extension")
+        self.a = {name: self.d.intern_atom(name) for name in self.ATOMS}
+        self.a_cm = self.d.intern_atom(f"_NET_WM_CM_S{self.screen_num}")
+        self.a_lock = self.d.intern_atom(f"_MINTMOTION_S{self.screen_num}")
+        a = self.a
+        self.covering_types = {a["_NET_WM_WINDOW_TYPE_NORMAL"], a["_NET_WM_WINDOW_TYPE_DIALOG"],
+                               a["_NET_WM_WINDOW_TYPE_UTILITY"]}
+        self.relevant = {a[n] for n in ("_NET_WM_WINDOW_TYPE", "_NET_WM_STATE", "_NET_WM_DESKTOP",
+                                        "_NET_WM_WINDOW_OPACITY",
+                                        "_NET_WM_STRUT", "_NET_WM_STRUT_PARTIAL", "_GTK_FRAME_EXTENTS")}
+
+        # Una sola instancia por pantalla: una selección X hace de cerrojo y
+        # se libera sola si este proceso muere.
+        self.lock_win = self.root.create_window(-10, -10, 1, 1, 0, X.CopyFromParent, X.InputOnly)
+        for _ in range(30):
+            if self.d.get_selection_owner(self.a_lock) == X.NONE:
+                break
+            time.sleep(0.2)   # puede ser una instancia que se está cerrando (tarda hasta 5 s)
+        else:
+            raise SystemExit(0)   # ya hay un supervisor en marcha
+        self.lock_win.set_selection_owner(self.a_lock, X.CurrentTime)
+        self.d.sync()
+        owner = self.d.get_selection_owner(self.a_lock)
+        if owner == X.NONE or owner.id != self.lock_win.id:
+            raise SystemExit(0)
+
+        # Formato de imagen del servidor: la máscara necesita 32 bits por píxel
+        info = self.d.display.info
+        bpp = {f.depth: f.bits_per_pixel for f in info.pixmap_formats}
+        self.lsb_first = info.image_byte_order == X.LSBFirst
+        self.can_mask = (bpp.get(self.screen.root_depth) == 32 and
+                         info.bitmap_format_bit_order == info.image_byte_order and
+                         info.bitmap_format_scanline_pad == 32)
+        self.matcher = KeyMatcher(self.lsb_first)
+        self.lanes = Lanes()
+        # Visual de 32 bits (ARGB) para la capa de iconos
+        self.vis32 = None
+        # Solo con el formato habitual: 8 bits por canal y orden rojo-verde-azul
+        root_ok = self.screen.root_depth == 24 and any(
+            v.visual_id == self.screen.root_visual and v.red_mask == 0xff0000 and v.blue_mask == 0xff
+            for dp in self.screen.allowed_depths if dp.depth == 24 for v in dp.visuals)
+        if root_ok and self.can_mask and self.lsb_first and bpp.get(32) == 32:
+            for dp in self.screen.allowed_depths:
+                if dp.depth == 32:
+                    for v in dp.visuals:
+                        if v.visual_class == X.TrueColor and v.red_mask == 0xff0000 and \
+                                v.green_mask == 0xff00 and v.blue_mask == 0xff:
+                            self.vis32 = v.visual_id
+                            break
+        self.cmap32 = None
+        self.alpha = False        # iconos con transparencia real (hace falta compositor)
+        self.phase = None         # midiendo: None | "white" | "black"
+        self.phase_t = 0.0
+        self.probe_base = 0
+        self.probe_px = 0
+        self.refine_id = 0
+        self.refine_fails = 0
+        self.refine_times = []
+        self.probe_snapshot = None
+        # DAMAGE y Composite rechazan cualquier petición hasta que el cliente
+        # dice qué versión habla.
+        self.have_damage = self.have_composite = False
+        try:
+            if self.d.has_extension("DAMAGE") and hasattr(self.root, "damage_create"):
+                self.d.damage_query_version()
+                self.have_damage = True
+        except Exception:
+            pass
+        try:
+            if self.d.has_extension("Composite") and hasattr(self.root, "composite_redirect_window"):
+                self.d.composite_query_version()
+                self.have_composite = True
+        except Exception:
+            pass
+        self.damage_event = self.d.extension_event.DamageNotify if self.have_damage else None
+        self.have_dpms = self.d.has_extension("DPMS") and hasattr(self.d, "dpms_info")
+        self.randr_event = None
+
+        self.loop = GLib.MainLoop()
+        self.config = read_config()
+        self.config_stamp = self._config_stamp()
+        self.argv = None          # opciones de mpv preparadas por mintmotion-renderer
+        self.prepare_gen = 0
+        self.players = []
+        self.own = {}             # id de ventana propia -> Player
+        self.clients = {}         # id de ventana gestionada -> WinInfo
+        self.frames = {}          # id de cliente -> ventana de nivel superior (marco)
+        self.desks = {}           # id -> DesktopWindow
+        self.or_windows = {}      # ventanas sin gestionar visibles: id -> (x, y, w, h, profundidad)
+        self.redirected = {}      # ventanas redirigidas por nosotros (sin compositor)
+        self.monitors = []
+        self.root_size = (self.screen.width_in_pixels, self.screen.height_in_pixels)
+        self.seq = 0
+        self.stopping = False
+        self.hiding = False       # cerrando: el vídeo tapa los iconos hasta que vuelve el fondo
+        self.timeouts = set()
+        self.update_id = 0
+        self.mask_id = 0
+        self.trim_id = 0
+        self.monitors_id = 0
+        self.config_id = 0
+        self.backdrop_id = 0
+        self.reasserts = []
+        self.keyed_at = 0.0
+        self.screensaver = False
+        self.session_inactive = False
+        self.display_off = False
+        self.inactive_translucent = False
+        self.last_state = None
+        self.last_sockets = None
+        self.polls = 0
+
+        self.xfconf = Xfconf()
+        self.backdrop = Backdrop(self.xfconf, self.screen_num)
+        self.alpha = self._alpha_possible()
+        self.backdrop.key = KEY_BLACK if self.alpha else KEY_RGB
+        self._watch_dbus()
+
+        self.root.change_attributes(event_mask=X.PropertyChangeMask | X.SubstructureNotifyMask |
+                                    X.StructureNotifyMask)
+        try:
+            from Xlib.ext import randr
+            self.d.xrandr_query_version()
+            self.root.xrandr_select_input(randr.RRScreenChangeNotifyMask)
+            self.randr_event = self.d.extension_event.ScreenChangeNotify
+        except Exception:
+            pass
+        GLib.io_add_watch(self.d.fileno(), GLib.PRIORITY_DEFAULT,
+                          GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._x_ready)
+
+        # Vigilancia de la configuración y del interruptor «xfce-enabled»
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        self.monitor = Gio.File.new_for_path(CONFIG_DIR).monitor_directory(Gio.FileMonitorFlags.WATCH_MOVES, None)
+        self.monitor.connect("changed", self._config_dir_changed)
+
+        for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)
+
+        GLib.timeout_add_seconds(POLL_SECONDS, lambda: self.guard(self._poll) or True)
+        GLib.timeout_add_seconds(HEALTH_EVERY_S,
+                                 lambda: self.guard(lambda: [p.check_health() for p in self.players]) or True)
+        GLib.timeout_add_seconds(RAM_EVERY_S,
+                                 lambda: self.guard(lambda: [p.check_ram() for p in self.players]) or True)
+
+        write_atomic(PID_FILE, str(os.getpid()))
+        self.guard(self._startup, 0)
+
+    # ---------- utilidades ----------
+
+    def next_seq(self):
+        self.seq += 1
+        return self.seq
+
+    def guard(self, fn, *args):
+        """Ejecuta fn y después entrega los eventos X que hayan quedado en la
+        cola de Xlib (los que llegaron mientras se esperaba una respuesta).
+        Ningún fallo inesperado debe tumbar el supervisor."""
+        try:
+            fn(*args)
+            if self.x_ok:
+                self._drain()
+        except xerror.ConnectionClosedError:
+            self._x_lost()
+        except (BrokenPipeError, ConnectionResetError):
+            self._x_lost()
+        except Exception:
+            import traceback
+            log("unexpected error:\n" + traceback.format_exc())
+        return None
+
+    def timeout(self, ms, fn, *args):
+        box = []
+
+        def fire():
+            self.timeouts.discard(box[0])
+            self.guard(fn, *args)
+            return False
+
+        box.append(GLib.timeout_add(ms, fire))
+        self.timeouts.add(box[0])
+        return box[0]
+
+    def cancel(self, tid):
+        if tid in self.timeouts:
+            self.timeouts.discard(tid)
+            GLib.source_remove(tid)
+
+    def _x_error(self, err, request):
+        pass   # ventanas que desaparecen mientras se las consulta: es normal
+
+    def _x_ready(self, fd, cond):
+        if cond & (GLib.IO_HUP | GLib.IO_ERR):
+            self._x_lost()
+            return False
+        self.guard(lambda: None)
+        return self.x_ok
+
+    def _drain(self):
+        d = self.d
+        while True:
+            d.flush()
+            n = d.pending_events()
+            if not n:
+                return
+            for _ in range(n):
+                self._event(d.next_event())
+
+    def prop(self, win, name):
+        """Valor de una propiedad de 32 bits como lista de enteros, o None."""
+        try:
+            p = win.get_full_property(self.a[name], X.AnyPropertyType)
+        except xerror.XError:
+            return None
+        if p is None or p.format != 32:
+            return None
+        return list(p.value)
+
+    def toplevel(self, win):
+        """Ventana de nivel superior que contiene a «win» (el marco que le
+        pone el gestor de ventanas, o ella misma)."""
+        f = self.frames.get(win.id)
+        if f is not None:
+            return f
+        try:
+            cur = win
+            for _ in range(8):
+                parent = cur.query_tree().parent
+                if parent == X.NONE or parent.id == self.root.id:
+                    break
+                cur = parent
+        except xerror.XError:
+            return None
+        self.frames[win.id] = cur
+        return cur
+
+    # ---------- arranque ----------
+
+    def _startup(self, tries):
+        if not os.path.exists(ENABLED_FILE):
+            self.quit()
+            return
+        # Al iniciar sesión puede que el gestor de ventanas aún no esté listo
+        if tries < 30 and not self.prop(self.root, "_NET_SUPPORTING_WM_CHECK"):
+            self.timeout(500, self._startup, tries + 1)
+            return
+        log(f"supervisor started (pid {os.getpid()})")
+        log("icons: real transparency (compositor found)" if self.alpha else
+            "icons: cut-out mask (no compositor)")
+        debug(f"memory at start: {process_pss_kb(os.getpid())} KB (PSS)")
+        self._read_wm_settings()
+        self._scan_unmanaged()
+        self._sync_clients()
+        self.monitors = self._read_monitors()
+        self._prepare()
+
+    def _prepare(self):
+        """Pide a mintmotion-renderer las opciones de mpv para este vídeo
+        (adaptadas al mpv instalado). No bloquea."""
+        self.prepare_gen += 1
+        gen = self.prepare_gen
+        self.argv = None
+        video = self.config.get("video")
+        if not video or not os.path.isfile(video):
+            log(f"no video configured, or it does not exist: {video}")
+            for p in self.players:
+                p.destroy()
+            self.players = []
+            self.players_changed()
+            return
+        here = os.path.dirname(os.path.realpath(__file__))
+        renderer = os.path.join(here, "mintmotion-renderer")
+        if not os.path.exists(renderer):
+            renderer = SYSTEM_RENDERER
+        cmd = ["/usr/bin/python3", renderer, "--video", video, "--width", "1", "--height", "1",
+               "--token", "x", "--fit", str(self.config.get("fit")),
+               "--quality", str(self.config.get("quality")), "--print-mpv-args"]
+        try:
+            proc = Gio.Subprocess.new(cmd, Gio.SubprocessFlags.STDOUT_PIPE)
+        except GLib.Error as e:
+            log(f"could not launch the renderer: {e.message}")
+            return
+
+        def done(p, res):
+            try:
+                out = p.communicate_utf8_finish(res)[1] or ""
+            except GLib.Error:
+                out = ""
+            self.guard(self._prepared, gen, out)
+
+        proc.communicate_utf8_async(None, None, done)
+
+    def _prepared(self, gen, out):
+        if gen != self.prepare_gen or self.stopping:
+            return
+        lines = out.split("\n")
+        if lines and lines[-1] == "":
+            lines.pop()
+        if len(lines) < 3 or lines[0] != "mpv" or "--" not in lines:
+            log("the renderer could not prepare the mpv options")
+            self.write_state("error")
+            return
+        dd = lines.index("--")
+        self.argv = lines[:dd + 1] + ["\n".join(lines[dd + 1:])]   # la ruta puede llevar saltos de línea
+        if self.players:
+            for p in self.players:
+                p.failed = False
+                p.restart_times = []
+                p.reset_decoder()
+                p.relaunch(keep_pos=False)
+        self._sync_players()
+
+    # ---------- monitores y reproductores ----------
+
+    def _read_monitors(self):
+        mons = []
+        try:
+            res = self.root.xrandr_get_monitors()
+            stamp = None
+            for m in res.monitors:
+                if m.width_in_pixels <= 0 or m.height_in_pixels <= 0:
+                    continue
+                # xfdesktop nombra sus ajustes con el nombre de la primera salida
+                name = None
+                try:
+                    if m.crtcs:
+                        if stamp is None:
+                            stamp = self.root.xrandr_get_screen_resources_current().config_timestamp
+                        name = self.d.xrandr_get_output_info(m.crtcs[0], stamp).name
+                    if not name:
+                        name = self.d.get_atom_name(m.name)
+                except Exception:
+                    name = None
+                mons.append(Monitor(name, m.x, m.y, m.width_in_pixels, m.height_in_pixels))
+        except Exception:
+            mons = []
+        if not mons:
+            w, h = self.root_size
+            mons = [Monitor(None, 0, 0, w, h)]
+        # Monitores duplicados (modo espejo) o contenidos en otro: uno solo
+        out = []
+        for m in sorted(mons, key=lambda m: -(m.w * m.h)):
+            if not any(o.x <= m.x and o.y <= m.y and o.x + o.w >= m.x + m.w and o.y + o.h >= m.y + m.h
+                       for o in out):
+                out.append(m)
+        out.sort(key=lambda m: (m.x, m.y))
+        return out
+
+    def _monitors_changed_soon(self):
+        if not self.monitors_id:
+            self.monitors_id = self.timeout(1000, self._monitors_changed)
+
+    def _monitors_changed(self):
+        self.monitors_id = 0
+        try:
+            g = self.root.get_geometry()
+            self.root_size = (g.width, g.height)
+        except xerror.XError:
+            pass
+        mons = self._read_monitors()
+        if [(m.name, m.rect) for m in mons] != [(m.name, m.rect) for m in self.monitors]:
+            self.monitors = mons
+            self._sync_players()
+
+    def _sync_players(self):
+        """Un reproductor por monitor; los que ya estaban y no han cambiado se conservan."""
+        if self.stopping or self.argv is None:
+            return
+        old = {p.mon.rect: p for p in self.players}
+        players = []
+        for m in self.monitors:
+            p = old.pop(m.rect, None)
+            if p is not None:
+                p.mon.name = m.name
+            else:
+                p = Player(self, m)
+                p.start()
+            players.append(p)
+        for p in old.values():
+            p.destroy()
+        self.players = players
+        self.players_changed()
+
+    def create_overlay_window(self, mon, token):
+        """Ventana ARGB del tamaño del monitor para los iconos. Mismos
+        atributos que la del vídeo: misma capa, sin foco y sin entrada."""
+        if self.cmap32 is None:
+            self.cmap32 = self.root.create_colormap(self.vis32, X.AllocNone)
+        win = self.root.create_window(
+            mon.x, mon.y, mon.w, mon.h, 0, 32, X.InputOutput, self.vis32,
+            background_pixel=0, border_pixel=0, colormap=self.cmap32,
+            event_mask=X.StructureNotifyMask | X.ExposureMask)
+        self._window_hints(win, mon, f"MintMotion icons {token}", "mintmotion-icons")
+        return win
+
+    def create_video_window(self, mon, token):
+        win = self.root.create_window(
+            mon.x, mon.y, mon.w, mon.h, 0, self.screen.root_depth, X.InputOutput, X.CopyFromParent,
+            background_pixmap=X.NONE,   # sin fondo: conserva el último fotograma
+            event_mask=X.StructureNotifyMask)
+        self._window_hints(win, mon, f"MintMotion {token}", WM_CLASS)
+        return win
+
+    def _window_hints(self, win, mon, title, wm_class):
+        a = self.a
+        win.set_wm_name(title)
+        win.change_property(a["_NET_WM_NAME"], a["UTF8_STRING"], 8, title.encode("utf-8"))
+        win.set_wm_class(wm_class, wm_class)
+        win.set_wm_hints(flags=1, input=0)   # InputHint, input = False: nunca acepta el foco
+        win.set_wm_normal_hints(flags=(1 | 2 | 4 | 16 | 32),   # USPosition|USSize|PPosition|PMinSize|PMaxSize
+                                x=mon.x, y=mon.y, width=mon.w, height=mon.h,
+                                min_width=mon.w, min_height=mon.h, max_width=mon.w, max_height=mon.h)
+        # Tipo escritorio + «por debajo»: xfwm4 la pone en la capa «below»,
+        # entre el escritorio y las ventanas normales, sin bordes ni sombra,
+        # fuera de la lista de ventanas y de Alt+Tab.
+        win.change_property(a["_NET_WM_WINDOW_TYPE"], Xatom.ATOM, 32, [a["_NET_WM_WINDOW_TYPE_DESKTOP"]])
+        win.change_property(a["_NET_WM_STATE"], Xatom.ATOM, 32, [
+            a["_NET_WM_STATE_STICKY"], a["_NET_WM_STATE_SKIP_TASKBAR"],
+            a["_NET_WM_STATE_SKIP_PAGER"], a["_NET_WM_STATE_BELOW"]])
+        win.change_property(a["_NET_WM_DESKTOP"], Xatom.CARDINAL, 32, [0xFFFFFFFF])
+        # 2 = no desviar nunca del compositor
+        win.change_property(a["_NET_WM_BYPASS_COMPOSITOR"], Xatom.CARDINAL, 32, [2])
+        win.change_property(a["_MOTIF_WM_HINTS"], a["_MOTIF_WM_HINTS"], 32, [2, 0, 0, 0, 0])   # sin decoraciones
+        # Región de entrada vacía: los clics y la rueda la atraviesan y llegan
+        # a xfdesktop, que sigue funcionando igual (menú, iconos, arrastrar…).
+        win.shape_rectangles(shape.SO.Set, shape.SK.Input, X.Unsorted, 0, 0, [])
+        self.d.sync()
+
+    # ---------- capa de iconos: modo y medición de la transparencia ----------
+
+    def _alpha_possible(self):
+        """La capa de iconos necesita un compositor (xfwm4 con el suyo
+        activado, picom…) que mezcle la ventana ARGB con el vídeo."""
+        if self.vis32 is None or os.environ.get("MINTMOTION_NO_ALPHA"):
+            return False
+        try:
+            return self.d.get_selection_owner(self.a_cm) != X.NONE
+        except xerror.XError:
+            return False
+
+    def _check_mode(self):
+        want = self._alpha_possible()
+        if want == self.alpha or self.stopping:
+            return
+        self.alpha = want
+        log("compositor found: icons with real transparency" if want else
+            "compositor gone: icons with the cut-out mask")
+        self._refine_reset()
+        self.backdrop.set_key(KEY_BLACK if want else KEY_RGB)
+        for p in self.players:
+            if want:
+                p.make_overlay()
+            else:
+                p.drop_overlay()
+                p.sigs, p.mask = {}, None
+        self._sync_redirects()
+        self._all_dirty()
+
+    def _check_stacking(self):
+        """Los iconos tienen que ir justo encima de su vídeo."""
+        if not self.alpha:
+            return
+        st = self.prop(self.root, "_NET_CLIENT_LIST_STACKING") or []
+        pos = {w: i for i, w in enumerate(st)}
+        for p in self.players:
+            if p.ov is not None and p.shown and p.settled:
+                i, j = pos.get(p.win.id), pos.get(p.ov.id)
+                if i is not None and j is not None and j != i + 1:
+                    p.settle()
+
+    def capture_strip(self, m, y, rows, fill):
+        """Lo que pinta xfdesktop en una franja del monitor, como una imagen
+        de 32 bits por píxel («fill» donde no llega) con el cuarto byte a
+        cero: el servidor no garantiza qué deja en él."""
+        shots = [s for s in (dw.capture(m, y, rows) for dw in self.desks.values()
+                             if dw.keyed and dw.overlaps(m)) if s is not None]
+        if not shots:
+            return None
+        n = m.w * rows
+        if len(shots) == 1 and shots[0][2] == m.w and shots[0][3] == rows:
+            buf = bytearray(shots[0][4])
+        else:
+            buf = bytearray(bytes((fill,)) * (n * 4))
+            for ix0, iy0, iw, ih, raw in shots:
+                for r in range(ih):
+                    o = ((iy0 - m.y - y + r) * m.w + ix0 - m.x) * 4
+                    buf[o:o + iw * 4] = raw[r * iw * 4:(r + 1) * iw * 4]
+        buf[3::4] = bytes(n)
+        return buf
+
+    def capture_foreign(self, m, y, rows):
+        """Lo que pintan en la franja las ventanas de escritorio que no son
+        de xfdesktop: [(x0, y0, ancho, alto, datos, profundidad)]."""
+        out = []
+        for dw in self.desks.values():
+            if not dw.keyed and dw.overlaps(m):
+                s = dw.capture(m, y, rows)
+                if s is not None:
+                    out.append(s + (dw.depth,))
+        return out
+
+    def _probe_rows(self):
+        """Tres filas de cada ventana de xfdesktop."""
+        out = []
+        for dw in self.desks.values():
+            if dw.rect is None or not dw.keyed:
+                continue
+            w, h = dw.rect[2], dw.rect[3]
+            for f in (1, 2, 3):
+                try:
+                    raw = dw.win.get_image(0, h * f // 4, w, 1, X.ZPixmap, 0xffffffff).data
+                except xerror.XError:
+                    continue
+                if len(raw) == w * 4:
+                    out.append(raw)
+        return out
+
+    def _probe(self, rgb):
+        """Cuántos píxeles de esas filas son exactamente negros (o blancos)."""
+        total = px = 0
+        for raw in self._probe_rows():
+            w = len(raw) // 4
+            b, g, r = (int.from_bytes(raw[i::4], "little") for i in (0, 1, 2))
+            if rgb == KEY_BLACK:
+                total += (b | g | r).to_bytes(w, "little").count(0)
+            else:
+                total += (b & g & r).to_bytes(w, "little").count(255)
+            px += w
+        self.probe_px = px
+        return total
+
+    def keyed(self):
+        """¿Muestra xfdesktop el color llave negro?"""
+        if not self.backdrop.backup:
+            return False
+        n = self._probe(KEY_BLACK)
+        return self.probe_px > 0 and n >= MIN_VISIBLE * self.probe_px
+
+    def request_refine(self):
+        if self.stopping or not self.alpha:
+            return
+        if self.refine_id:
+            self.cancel(self.refine_id)
+        # Medir repinta xfdesktop dos veces y escribe en xfconf: si algo
+        # cambia sin parar, se espera más entre una medición y la siguiente.
+        now = time.monotonic()
+        self.refine_times = [t for t in self.refine_times if now - t < 10]
+        busy = len(self.refine_times) >= 8
+        self.refine_id = self.timeout(REFINE_BUSY_MS if busy else REFINE_QUIET_MS, self._refine_start)
+
+    def _refine_reset(self):
+        if self.refine_id:
+            self.cancel(self.refine_id)
+            self.refine_id = 0
+        self.phase = None
+        self.refine_fails = 0
+        for p in self.players:
+            p.wshots = {}
+
+    def _refine_start(self):
+        self.refine_id = 0
+        if self.stopping or not self.alpha or self.phase:
+            return
+        if not any(p.pending for p in self.players):
+            return
+        base = self._probe(KEY_BLACK)
+        if not self.probe_px or base < MIN_VISIBLE * self.probe_px:
+            return   # sin llave a la vista; se volverá a pedir cuando xfdesktop repinte
+        self.refine_times.append(time.monotonic())
+        self.probe_base = base
+        self.phase = "white"
+        self.phase_t = time.monotonic()
+        self.backdrop.set_key(KEY_WHITE)
+        self.timeout(10, self._refine_poll)
+
+    def _refine_poll(self):
+        if not self.phase or self.stopping:
+            return
+        white = self.phase == "white"
+        if self._probe(KEY_WHITE if white else KEY_BLACK) < 0.9 * self.probe_base:
+            if time.monotonic() - self.phase_t > REFINE_TIMEOUT_S:
+                self._refine_abort()
+            else:
+                self.timeout(10, self._refine_poll)
+            return
+        if white:
+            for p in self.players:
+                p.capture_white()
+            self.phase = "black"
+            self.phase_t = time.monotonic()
+            self.backdrop.set_key(KEY_BLACK)
+            self.timeout(10, self._refine_poll)
+            return
+        self.phase = None
+        self.refine_fails = 0
+        t0 = time.monotonic()
+        for p in self.players:
+            p.finish_refine()
+        debug(f"icons: transparency measured in {(time.monotonic() - t0) * 1000:.0f} ms")
+        if any(p.pending for p in self.players):
+            self.request_refine()
+        self.schedule_masks()
+
+    def _refine_abort(self):
+        """xfdesktop no ha repintado a tiempo: se deja el fondo en negro y se
+        reintenta más tarde (unas pocas veces)."""
+        log("icons: xfdesktop did not repaint in time; keeping the provisional transparency")
+        self.phase = None
+        for p in self.players:
+            p.wshots = {}
+        self.backdrop.set_key(KEY_BLACK)
+        self.refine_fails += 1
+        if self.refine_fails <= REFINE_RETRIES:
+            self.timeout(1000, self.request_refine)
+        self.schedule_masks()
+
+    def players_changed(self):
+        """Algo ha cambiado en los reproductores: se actualizan el fondo de
+        xfdesktop, el estado publicado y la pausa."""
+        self.publish()
+        self._sync_backdrop_soon(0)
+        self._sync_redirects()
+        self.queue_update()
+
+    def publish(self):
+        """Estado y sockets de mpv, para la ventana de MintMotion."""
+        socks = "\n".join(p.socket for p in self.players if p.mpv is not None and p.socket)
+        if socks != self.last_sockets:
+            self.last_sockets = socks
+            write_atomic(SOCKET_POINTER, socks)
+        states = [p.state() for p in self.players]
+        for s in ("reproduciendo", "pausado", "dormido", "arrancando", "error"):
+            if s in states:
+                self.write_state(s)
+                return
+        self.write_state("arrancando" if self.argv is None and not self.stopping else None)
+
+    def write_state(self, state):
+        if state == self.last_state:
+            return
+        self.last_state = state
+        if state:
+            write_atomic(STATE_FILE, state)
+        else:
+            unlink(STATE_FILE)
+
+    # ---------- fondo de xfdesktop ----------
+
+    def _sync_backdrop_soon(self, ms=400):
+        if not self.backdrop_id and not self.stopping:
+            self.backdrop_id = self.timeout(ms, self._sync_backdrop)
+
+    def _sync_backdrop(self):
+        self.backdrop_id = 0
+        if self.stopping:
+            return
+        names = [p.mon.name for p in self.players if p.shown and not p.failed]
+        n = self.prop(self.root, "_NET_NUMBER_OF_DESKTOPS")
+        had = bool(self.backdrop.backup)
+        self.backdrop.sync(names, n[0] if n else 1)
+        if names and not had:
+            self.keyed_at = time.monotonic()
+            self.timeout(5000, self._check_keyed)
+        if self.alpha:
+            # Si el fondo del usuario ya era negro liso, xfdesktop no repinta
+            # y no avisa: se mira el escritorio de todos modos.
+            self._all_dirty()
+
+    def _check_keyed(self):
+        """Si a los 5 s el fondo sigue sin ser la llave en algún monitor, es
+        que xfdesktop lo guarda con otro nombre: se aplica a todos."""
+        if self.stopping or self.backdrop.broad or not self.can_mask:
+            return
+        if self.alpha and (self.phase or self.keyed()):
+            return
+        for p in self.players:
+            if p.shown and (p.mask == "full" or p.ov is not None) and \
+                    any(dw.overlaps(p.mon) for dw in self.desks.values()):
+                log("the desktop background did not change; applying the key colour to every monitor known to xfconf")
+                self.backdrop.broad = True
+                self._sync_backdrop_soon(0)
+                return
+
+    def _xfconf_changed(self, channel, prop, value):
+        if channel == "xfwm4":
+            if prop == "/general/inactive_opacity":
+                self._read_wm_settings()
+                self.queue_update()
+            return
+        if channel != Backdrop.CHANNEL or self.stopping or not self.backdrop.manages(prop):
+            return
+        if Backdrop.is_key(prop.rsplit("/", 1)[1], value):
+            return
+        # El usuario ha tocado su fondo con el vídeo puesto: se recuerda lo
+        # que ha elegido y se vuelve a poner la llave (con un límite, por si
+        # otro programa insiste).
+        self.backdrop.user_changed(prop, value)
+        now = time.monotonic()
+        self.reasserts = [t for t in self.reasserts if now - t < 60]
+        if len(self.reasserts) < 6:
+            self.reasserts.append(now)
+            self._sync_backdrop_soon(600)
+
+    def _read_wm_settings(self):
+        # xfwm4 puede hacer translúcidas las ventanas inactivas (Ajustes del
+        # gestor de ventanas → Compositor): entonces no tapan el escritorio.
+        v = self.xfconf.get("xfwm4", "/general/inactive_opacity")
+        try:
+            self.inactive_translucent = v is not None and int(v.unpack()) < 100
+        except (TypeError, ValueError):
+            self.inactive_translucent = False
+
+    # ---------- D-Bus: xfconf, salvapantallas, sesión ----------
+
+    def _watch_dbus(self):
+        bus = self.xfconf.bus
+        if bus is None:
+            return
+
+        def xfconf_signal(conn, sender, path, iface, name, params):
+            channel, prop, value = params.get_child_value(0).get_string(), \
+                params.get_child_value(1).get_string(), params.get_child_value(2).get_variant()
+            self.guard(self._xfconf_changed, channel, prop, value)
+
+        bus.signal_subscribe(Xfconf.NAME, Xfconf.NAME, "PropertyChanged", Xfconf.PATH, None,
+                             Gio.DBusSignalFlags.NONE, xfconf_signal)
+
+        def saver_signal(conn, sender, path, iface, name, params):
+            # org.xfce.ScreenSaver, org.cinnamon.ScreenSaver, org.freedesktop.ScreenSaver…
+            if not iface.endswith(".ScreenSaver") or params.n_children() < 1:
+                return
+            v = params.get_child_value(0)
+            if v.get_type_string() == "b":
+                self.screensaver = v.get_boolean()
+                self.guard(self.queue_update)
+
+        bus.signal_subscribe(None, None, "ActiveChanged", None, None,
+                             Gio.DBusSignalFlags.NONE, saver_signal)
+
+        # Sesión inactiva (cambio de usuario, otra consola, bloqueo con
+        # light-locker): logind lo indica en la propiedad «Active».
+        try:
+            sysbus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            L = "org.freedesktop.login1"
+            spath = sysbus.call_sync(L, "/org/freedesktop/login1", L + ".Manager", "GetSessionByPID",
+                                     GLib.Variant("(u)", (os.getpid(),)), GLib.VariantType("(o)"),
+                                     Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+
+            def get(name):
+                return sysbus.call_sync(L, spath, "org.freedesktop.DBus.Properties", "Get",
+                                        GLib.Variant("(ss)", (L + ".Session", name)),
+                                        GLib.VariantType("(v)"), Gio.DBusCallFlags.NONE, 2000, None).unpack()[0]
+
+            if get("Type") == "x11" and get("Seat")[0]:
+                self.session_inactive = not get("Active")
+
+                def session_signal(conn, sender, path, iface, name, params):
+                    changed = params.get_child_value(1).unpack()
+                    if "Active" in changed:
+                        self.session_inactive = not changed["Active"]
+                        self.guard(self.queue_update)
+
+                sysbus.signal_subscribe(L, "org.freedesktop.DBus.Properties", "PropertiesChanged", spath,
+                                        None, Gio.DBusSignalFlags.NONE, session_signal)
+                self.sysbus = sysbus
+        except Exception:
+            pass   # sin logind, o sesión sin asiento (remota): no se usa
+
+    # ---------- configuración ----------
+
+    @staticmethod
+    def _config_stamp():
+        try:
+            return os.stat(CONFIG_FILE).st_mtime_ns
+        except OSError:
+            return 0
+
+    def _config_dir_changed(self, mon, file, other, event):
+        names = {f.get_basename() for f in (file, other) if f is not None}
+        if names & {"config.json", "xfce-enabled"} and not self.config_id:
+            self.config_id = self.timeout(300, self._config_reload)
+
+    def _config_reload(self):
+        self.config_id = 0
+        if self.stopping:
+            return
+        if not os.path.exists(ENABLED_FILE):
+            log("video background turned off")
+            self.shutdown()
+            return
+        old, self.config = self.config, read_config()
+        self.config_stamp = self._config_stamp()
+        c = self.config
+        if any(c.get(k) != old.get(k) for k in ("video", "fit", "quality")):
+            self._prepare()
+        elif any(c.get(k) != old.get(k) for k in ("hwdec", "gpu_env")):
+            for p in self.players:
+                p.reset_decoder()
+                p.relaunch()
+        else:
+            for p in self.players:
+                if p.paused:
+                    p.cancel_sleep()
+                p.paused = None
+            self.queue_update()
+
+    # ---------- eventos X ----------
+
+    def _event(self, ev):
+        t = ev.type
+        if t == X.PropertyNotify:
+            if ev.window.id == self.root.id:
+                self._root_property(ev.atom)
+            elif ev.atom in self.relevant:
+                info = self.clients.get(ev.window.id)
+                if info is not None:
+                    info.dirty = True
+                    if ev.atom == self.a["_NET_WM_WINDOW_TYPE"]:
+                        self._sync_desks()
+                    self.queue_update()
+        elif t == X.ConfigureNotify:
+            wid = ev.window.id
+            if wid == self.root.id:
+                self._monitors_changed_soon()
+                return
+            if wid in self.or_windows:
+                self.or_windows[wid] = (ev.x, ev.y, ev.width, ev.height, self.or_windows[wid][4])
+            if wid in self.desks:
+                self._locate(self.desks[wid])
+                self._all_dirty()
+            self.queue_update()
+        elif t == X.MapNotify:
+            wid = ev.window.id
+            if ev.event.id == self.root.id and ev.override and wid not in self.own:
+                self._track_unmanaged(ev.window)
+            self.queue_update()
+        elif t == X.UnmapNotify:
+            self.or_windows.pop(ev.window.id, None)
+            self.queue_update()
+        elif t == X.DestroyNotify:
+            wid = ev.window.id
+            self.or_windows.pop(wid, None)
+            self.frames.pop(wid, None)
+            self.redirected.pop(wid, None)
+            if self.clients.pop(wid, None) is not None:
+                self._sync_desks()
+            self.queue_update()
+        elif t == X.ReparentNotify:
+            wid = ev.window.id
+            self.frames.pop(wid, None)
+            p = self.own.get(wid)
+            if p is not None and ev.parent.id != self.root.id:
+                p.settle()
+                self._sync_redirects()
+            self.queue_update()
+        elif self.damage_event is not None and t == self.damage_event:
+            dw = self.desks.get(ev.drawable.id)
+            if dw is not None and dw.rect is not None:
+                y = dw.rect[1] + ev.area.y
+                for p in self.players:
+                    if p.shown:
+                        p.mark_dirty(y - p.mon.y, y + ev.area.height - p.mon.y)
+        elif t == X.Expose:
+            p = self.own.get(ev.window.id)
+            if p is not None and p.ov is not None and ev.window.id == p.ov.id:
+                p.paint(ev.y, ev.height)
+        elif self.randr_event is not None and t == self.randr_event:
+            self._monitors_changed_soon()
+
+    def _root_property(self, atom):
+        a = self.a
+        if atom == a["_NET_CLIENT_LIST"]:
+            self._sync_clients()
+        elif atom == a["_NET_NUMBER_OF_DESKTOPS"]:
+            self._sync_backdrop_soon()
+        elif atom == a["_NET_SUPPORTING_WM_CHECK"]:
+            self.frames.clear()
+            self._sync_clients()
+        elif atom not in (a["_NET_CLIENT_LIST_STACKING"], a["_NET_CURRENT_DESKTOP"],
+                          a["_NET_ACTIVE_WINDOW"], a["_NET_SHOWING_DESKTOP"]):
+            return
+        self.queue_update()
+
+    def _track_unmanaged(self, win):
+        try:
+            g = win.get_geometry()
+        except xerror.XError:
+            return
+        self.or_windows[win.id] = (g.x, g.y, g.width + 2 * g.border_width,
+                                   g.height + 2 * g.border_width, g.depth)
+
+    def _scan_unmanaged(self):
+        try:
+            children = self.root.query_tree().children
+        except xerror.XError:
+            return
+        for w in children:
+            try:
+                at = w.get_attributes()
+            except xerror.XError:
+                continue
+            if at.override_redirect and at.map_state == X.IsViewable and at.win_class == X.InputOutput:
+                self._track_unmanaged(w)
+
+    def _sync_clients(self):
+        ids = self.prop(self.root, "_NET_CLIENT_LIST") or []
+        cur = set(ids)
+        for wid in cur - set(self.clients):
+            win = self.d.create_resource_object("window", wid)
+            if wid not in self.own:
+                win.change_attributes(event_mask=X.PropertyChangeMask | X.StructureNotifyMask)
+            self.clients[wid] = WinInfo(win)
+        for wid in set(self.clients) - cur:
+            del self.clients[wid]
+            self.frames.pop(wid, None)
+        self._sync_desks()
+
+    def info(self, wid):
+        info = self.clients.get(wid)
+        if info is None:
+            return None
+        if info.dirty:
+            self._load(info)
+        return info
+
+    def _load(self, info):
+        a = self.a
+        w = info.win
+        info.dirty = False
+        types = self.prop(w, "_NET_WM_WINDOW_TYPE") or []
+        known = self.covering_types | {a["_NET_WM_WINDOW_TYPE_DESKTOP"], a["_NET_WM_WINDOW_TYPE_DOCK"]}
+        info.type = next((t for t in types if t in known), None)
+        if info.type is None and not types:
+            try:
+                transient = w.get_full_property(Xatom.WM_TRANSIENT_FOR, X.AnyPropertyType)
+            except xerror.XError:
+                transient = None
+            info.type = a["_NET_WM_WINDOW_TYPE_DIALOG"] if transient else a["_NET_WM_WINDOW_TYPE_NORMAL"]
+        info.state = frozenset(self.prop(w, "_NET_WM_STATE") or [])
+        v = self.prop(w, "_NET_WM_DESKTOP")
+        info.desktop = v[0] if v else None
+        v = self.prop(w, "_NET_WM_WINDOW_OPACITY")
+        info.opacity = v[0] if v else 0xFFFFFFFF
+        s = self.prop(w, "_NET_WM_STRUT_PARTIAL")
+        if not s or len(s) < 12:
+            s4 = self.prop(w, "_NET_WM_STRUT")
+            s = (list(s4[:4]) + [0, 1 << 30] * 4) if s4 and len(s4) >= 4 else None
+        info.strut = s if s and any(s[:4]) else None
+        v = self.prop(w, "_GTK_FRAME_EXTENTS")
+        info.gtk = v[:4] if v and len(v) >= 4 else None
+
+    # ---------- ventanas de escritorio (xfdesktop) y máscara ----------
+
+    def _sync_desks(self):
+        desk_type = self.a["_NET_WM_WINDOW_TYPE_DESKTOP"]
+        cur = set()
+        for wid in list(self.clients):
+            if wid in self.own:
+                continue
+            info = self.info(wid)
+            if info is not None and info.type == desk_type:
+                cur.add(wid)
+        if cur == set(self.desks):
+            return
+        for wid in set(self.desks) - cur:
+            dw = self.desks.pop(wid)
+            if dw.damage is not None:
+                try:
+                    self.d.damage_destroy(dw.damage)
+                except Exception:
+                    pass
+        xfdesk = set(self.prop(self.root, "XFCE_DESKTOP_WINDOW") or [])
+        for wid in cur - set(self.desks):
+            dw = DesktopWindow(self.clients[wid].win)
+            try:
+                cls = dw.win.get_wm_class() or ()
+                dw.depth = dw.win.get_geometry().depth
+            except xerror.XError:
+                cls = ()
+            dw.keyed = wid in xfdesk or any("xfdesktop" in (c or "").lower() for c in cls)
+            if self.have_damage:
+                from Xlib.ext import damage
+                try:
+                    dw.damage = dw.win.damage_create(damage.DamageReportRawRectangles)
+                except Exception:
+                    dw.damage = None
+            self._locate(dw)
+            self.desks[wid] = dw
+        debug(f"desktop windows: {[hex(w) for w in self.desks]} damage={self.have_damage}")
+        self._sync_redirects()
+        self._all_dirty()
+
+    def _locate(self, dw):
+        try:
+            g = dw.win.get_geometry()
+            o = self.root.translate_coords(dw.win, 0, 0)
+            dw.rect = (o.x, o.y, g.width, g.height)
+        except xerror.XError:
+            dw.rect = None
+
+    def _all_dirty(self):
+        for p in self.players:
+            if p.shown:
+                p.mark_dirty(0, p.mon.h)
+
+    def schedule_masks(self, ms=30):
+        if not self.mask_id:
+            self.mask_id = self.timeout(ms, self._run_masks)
+
+    def _run_masks(self):
+        self.mask_id = 0
+        for dw in self.desks.values():
+            if dw.rect is None:
+                self._locate(dw)
+        for p in self.players:
+            p.update_mask()
+        if self.trim_id:
+            self.cancel(self.trim_id)
+        self.trim_id = self.timeout(3000, self._trim)
+
+    def _trim(self):
+        self.trim_id = 0
+        self.matcher._consts.clear()
+        self.lanes.clear()
+        if DEBUG:
+            before = process_pss_kb(os.getpid())
+        release_memory()
+        if DEBUG:
+            debug(f"memory: {before} -> {process_pss_kb(os.getpid())} KB (PSS)")
+
+    def _sync_redirects(self):
+        """Sin compositor, el servidor X no guarda lo que queda tapado. Se le
+        pide que guarde (redirección automática) el contenido de xfdesktop,
+        para poder leer los iconos que tapa el vídeo, y el de las ventanas del
+        vídeo, para que conserven el último fotograma. Con compositor ya lo
+        hace él y no se toca nada."""
+        if not self.have_composite or not self.x_ok:
+            return
+        from Xlib.ext import composite
+        want = {}
+        if self.d.get_selection_owner(self.a_cm) == X.NONE and not self.stopping:
+            for win in [dw.win for dw in self.desks.values()] + \
+                       [p.win for p in self.players if p.win is not None and p.shown and p.ov is None]:
+                top = self.toplevel(win)
+                if top is not None and top.id != self.root.id:
+                    want[top.id] = top
+        for wid, top in want.items():
+            if wid not in self.redirected:
+                top.composite_redirect_window(composite.RedirectAutomatic)
+                self.redirected[wid] = top
+                self._all_dirty()
+        for wid in [w for w in self.redirected if w not in want]:
+            self.redirected.pop(wid).composite_unredirect_window(composite.RedirectAutomatic)
+
+    # ---------- pausa automática ----------
+
+    def queue_update(self):
+        if not self.update_id and not self.stopping:
+            self.update_id = self.timeout(150, self._update_playback)
+
+    def _poll(self):
+        """Red de seguridad: revisión periódica muy barata."""
+        if self.stopping:
+            return
+        # por si el aviso de cambios en la carpeta no llega (límite de inotify…)
+        if not os.path.exists(ENABLED_FILE) or self._config_stamp() != self.config_stamp:
+            if not self.config_id:
+                self.config_id = self.timeout(300, self._config_reload)
+        if self.have_dpms:
+            try:
+                i = self.d.dpms_info()
+                self.display_off = bool(i.state) and i.power_level != 0
+            except Exception:
+                self.display_off = False
+        self._check_mode()
+        self._check_stacking()
+        if self.alpha and not self.phase and \
+                any(p.shown and p.ov is not None and not p.asigs for p in self.players):
+            self._all_dirty()   # capa de iconos aún sin contenido: se reintenta
+        self._sync_redirects()
+        if not self.have_damage:
+            self._all_dirty()
+        self.polls += 1
+        if self.polls % 5 == 0:
+            mons = self._read_monitors()
+            if [(m.name, m.rect) for m in mons] != [(m.name, m.rect) for m in self.monitors]:
+                self._monitors_changed_soon()
+        self._update_playback()
+
+    def _update_playback(self):
+        if self.update_id:
+            self.cancel(self.update_id)
+            self.update_id = 0
+        if self.stopping or not self.players:
+            return
+        forced = self.screensaver or self.session_inactive or self.display_off
+        covered = None
+        if not forced and self.config.get("pause_when_covered"):
+            covered = self._covered()
+        for i, p in enumerate(self.players):
+            p.set_pause(bool(forced or (covered is not None and covered[i])))
+        self.publish()
+
+    def _work_areas(self):
+        """Área de cada monitor que no ocupan los paneles (lo que el
+        escritorio tiene que tener tapado para considerarlo tapado)."""
+        W, H = self.root_size
+        mons = [p.mon for p in self.players]
+        areas = [[m.x, m.y, m.x + m.w, m.y + m.h] for m in mons]
+        hidden = self.a["_NET_WM_STATE_HIDDEN"]
+        for wid in list(self.clients):
+            info = self.info(wid)
+            if info is None or not info.strut or hidden in info.state:
+                continue
+            left, right, top, bottom, ly0, ly1, ry0, ry1, tx0, tx1, bx0, bx1 = info.strut[:12]
+            for m, ar in zip(mons, areas):
+                mx1, my1 = m.x + m.w, m.y + m.h
+                # una reserva solo cuenta en el monitor donde termina
+                if top and m.y < top <= my1 and tx0 < mx1 and tx1 >= m.x:
+                    ar[1] = max(ar[1], top)
+                if bottom and m.y <= H - bottom < my1 and bx0 < mx1 and bx1 >= m.x:
+                    ar[3] = min(ar[3], H - bottom)
+                if left and m.x < left <= mx1 and ly0 < my1 and ly1 >= m.y:
+                    ar[0] = max(ar[0], left)
+                if right and m.x <= W - right < mx1 and ry0 < my1 and ry1 >= m.y:
+                    ar[2] = min(ar[2], W - right)
+        return [(x0, y0, x1 - x0, y1 - y0) for x0, y0, x1, y1 in areas]
+
+    def _covered(self):
+        """Para cada monitor, True si su escritorio queda tapado por completo
+        (por una ventana o por la suma de varias)."""
+        a = self.a
+        uncovered = [[r] if r[2] > 0 and r[3] > 0 else [] for r in self._work_areas()]
+        # Ventanas sin gestionar que cubren un monitor entero: salvapantallas,
+        # bloqueo de pantalla, juegos a pantalla completa. Las de 32 bits son
+        # capas transparentes (anotaciones, capturas) y no cuentan.
+        for x, y, w, h, depth in self.or_windows.values():
+            if depth == 32:
+                continue
+            for i, p in enumerate(self.players):
+                m = p.mon
+                if x <= m.x and y <= m.y and x + w >= m.x + m.w and y + h >= m.y + m.h:
+                    uncovered[i] = []
+        if not any(uncovered):
+            return [True] * len(uncovered)
+        cur = self.prop(self.root, "_NET_CURRENT_DESKTOP")
+        cur = cur[0] if cur else None
+        active = None
+        if self.inactive_translucent:
+            v = self.prop(self.root, "_NET_ACTIVE_WINDOW")
+            active = v[0] if v else 0
+        hidden, shaded, fullscreen = a["_NET_WM_STATE_HIDDEN"], a["_NET_WM_STATE_SHADED"], \
+            a["_NET_WM_STATE_FULLSCREEN"]
+        stacking = self.prop(self.root, "_NET_CLIENT_LIST_STACKING") or []
+        for wid in reversed(stacking):
+            if wid in self.own:
+                continue
+            info = self.info(wid)
+            if info is None or info.type not in self.covering_types:
+                continue
+            if hidden in info.state or shaded in info.state:
+                continue
+            if cur is not None and info.desktop is not None and info.desktop not in (cur, 0xFFFFFFFF):
+                continue
+            if info.opacity < 0xFFFFFFFF:
+                continue   # ventana translúcida: deja ver el fondo
+            # Las ventanas con canal alfa (32 bits) cuentan como las demás:
+            # casi todas son opacas (el terminal de Xfce lo es siempre) y no
+            # hay forma fiable de saber cuáles dejan ver el fondo.
+            full = fullscreen in info.state
+            if active is not None and wid != active and not full:
+                continue   # xfwm4 hace translúcidas las ventanas inactivas
+            rect = self._frame_rect(info)
+            if rect is None:
+                continue
+            for i in range(len(uncovered)):
+                if uncovered[i]:
+                    uncovered[i] = subtract_rect(uncovered[i], rect)
+            if not any(uncovered):
+                break
+        return [not u for u in uncovered]
+
+    def _frame_rect(self, info):
+        top = self.toplevel(info.win)
+        if top is None:
+            return None
+        try:
+            if top.get_attributes().map_state != X.IsViewable:
+                return None
+            g = top.get_geometry()
+            x, y, w, h = g.x, g.y, g.width + 2 * g.border_width, g.height + 2 * g.border_width
+        except xerror.XError:
+            self.frames.pop(info.win.id, None)
+            return None
+        if info.gtk:   # decoración propia (CSD): el marco incluye la sombra
+            left, right, t, b = info.gtk
+            x, y, w, h = x + left, y + t, w - left - right, h - t - b
+        return (x, y, w, h) if w > 0 and h > 0 else None
+
+    # ---------- cierre ----------
+
+    def _on_signal(self):
+        if self.stopping:
+            self.quit()
+        else:
+            self.guard(self.shutdown)
+        return True
+
+    def shutdown(self):
+        """Cierre ordenado: el vídeo tapa los iconos, se devuelve el fondo
+        del usuario y, cuando xfdesktop ya lo ha pintado, se quita el vídeo."""
+        if self.stopping:
+            return
+        self.stopping = True
+        self.hiding = True
+        self.phase = None
+        for tid in list(self.timeouts):
+            self.cancel(tid)
+        shown = [p for p in self.players if p.shown and p.win is not None]
+        had_key = bool(self.backdrop.backup) and self.backdrop.restore_changes(self._shown_workspace())
+        self.probe_snapshot = self._probe_rows() if self.alpha else None
+        for p in shown:
+            p._set_full()
+        self.d.flush()
+        self.backdrop.restore_all()
+        if shown and had_key and self.desks and self.can_mask:
+            self._wait_backdrop(time.monotonic())
+        else:
+            self._finish()
+
+    def _shown_workspace(self):
+        """Espacio de trabajo cuyo fondo pinta xfdesktop: uno fijo para todos
+        (lo normal) o el actual. None si no se puede saber."""
+        try:
+            v = self.xfconf.get(Backdrop.CHANNEL, "/backdrop/single-workspace-mode")
+            if v is None or v.unpack():
+                n = self.xfconf.get(Backdrop.CHANNEL, "/backdrop/single-workspace-number")
+                return int(n.unpack()) if n is not None else 0
+            cur = self.prop(self.root, "_NET_CURRENT_DESKTOP")
+            return cur[0] if cur else None
+        except Exception:
+            return None
+
+    def _wait_backdrop(self, t0):
+        """Espera (3 s como mucho) a que xfdesktop deje de mostrar la llave."""
+        waited = time.monotonic() - t0
+        if waited < 3.0 and (waited < 0.3 or self._still_keyed()):
+            GLib.timeout_add(100, lambda: self.guard(self._wait_backdrop, t0) and False)
+            return
+        self._finish()
+
+    def _still_keyed(self):
+        if self.alpha:
+            # con la capa de iconos: hasta que xfdesktop pinte otra cosa
+            return bool(self.probe_snapshot) and self._probe_rows() == self.probe_snapshot
+        for dw in self.desks.values():
+            try:
+                g = dw.win.get_geometry()
+                y = g.height // 2
+                raw = dw.win.get_image(0, y, g.width, 1, X.ZPixmap, 0xffffffff).data
+            except xerror.XError:
+                continue
+            if len(raw) == g.width * 4 and \
+                    self.matcher.bits(raw, g.width).count(b"1") > MIN_VISIBLE * g.width:
+                return True
+        return False
+
+    def _finish(self):
+        pending = [len(self.players)]
+
+        def one_done():
+            pending[0] -= 1
+            if pending[0] <= 0:
+                self.quit()
+
+        if not self.players:
+            self.quit()
+            return
+        for p in self.players:
+            proc = p.mpv
+            p.destroy()
+            if proc is None:
+                one_done()
+            else:
+                proc.wait_async(None, lambda pr, res: one_done())
+        self.players = []
+        self._sync_redirects()
+        self.d.flush()
+        GLib.timeout_add(4000, lambda: self.quit() and False)
+
+    def _x_lost(self):
+        """El servidor X se ha ido (cierre de sesión): ya no hay ventanas que
+        quitar; se devuelve el fondo del usuario para la próxima sesión."""
+        if not self.x_ok:
+            return
+        self.x_ok = False
+        self.stopping = True
+        for p in self.players:
+            if p.mpv is not None:
+                try:
+                    p.mpv.force_exit()
+                except GLib.Error:
+                    pass
+        try:
+            self.backdrop.restore_all()
+        except Exception:
+            pass
+        self.quit()
+
+    def quit(self):
+        unlink(SOCKET_POINTER)
+        unlink(STATE_FILE)
+        for p in self.players:
+            if p.socket:
+                unlink(p.socket)
+        pid = read_text(PID_FILE)
+        if pid and pid.strip() == str(os.getpid()):
+            unlink(PID_FILE)
+        if self.loop.is_running():
+            self.loop.quit()
+        else:
+            raise SystemExit(0)
+
+
+def main():
+    if "--restore" in sys.argv[1:]:
+        # Devuelve el fondo de xfdesktop si un cierre brusco lo dejó en el color llave
+        Backdrop(Xfconf()).restore_all()
+        return 0
+    if sys.argv[1:] and sys.argv[1] not in ("--autostart",):
+        print("usage: mintmotion-xfce [--autostart | --restore]", file=sys.stderr)
+        return 2
+    if not os.path.exists(ENABLED_FILE):
+        return 0   # el vídeo no está activado: nada que hacer
+    if os.environ.get("XDG_SESSION_TYPE") == "wayland" or not os.environ.get("DISPLAY"):
+        return 0
+    open_log()
+    try:
+        daemon = Daemon()
+    except xerror.DisplayError as e:
+        log(f"cannot open the X display: {e}")
+        return 1
+    daemon.loop.run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

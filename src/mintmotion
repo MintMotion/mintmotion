@@ -5,10 +5,11 @@
 # Copyright (C) 2026  José Antonio Ramos Miralles «Sombra» <hola@joseantonioramos.es>
 # Licencia: GPL-3.0-or-later (véase LICENSE)
 #
-# Permite elegir un vídeo como fondo de escritorio de Cinnamon, ajustar cómo
-# se adapta a la pantalla y aplicarlo, quitarlo o desinstalar el programa.
-# La reproducción la hace la extensión de Cinnamon «mintmotion@sombra», que
-# lee la configuración de ~/.config/mintmotion/config.json.
+# Permite elegir un vídeo como fondo de escritorio de Cinnamon o de Xfce,
+# ajustar cómo se adapta a la pantalla y aplicarlo, quitarlo o desinstalar el
+# programa. La reproducción la hace, en Cinnamon, la extensión
+# «mintmotion@sombra» y, en Xfce, el supervisor «mintmotion-xfce»; los dos leen
+# la configuración de ~/.config/mintmotion/config.json.
 #
 # En la ventana no se aplica nada hasta pulsar «Aplicar».
 # También admite uso por línea de órdenes (véase --help).
@@ -42,8 +43,14 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
 CACHE_DIR = os.path.join(_CACHE_HOME, "mintmotion")
 DATA_DIR = os.path.join(_DATA_HOME, "mintmotion")       # vídeos creados con «Optimizar»
 RUNTIME_DIR = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
-SOCKET_POINTER = os.path.join(RUNTIME_DIR, "mintmotion.socket")  # lo escribe la extensión
+SOCKET_POINTER = os.path.join(RUNTIME_DIR, "mintmotion.socket")  # lo escribe la extensión (o el supervisor)
 STATE_FILE = os.path.join(RUNTIME_DIR, "mintmotion.state")        # ídem: estado del reproductor
+
+# Xfce: no hay extensión; el vídeo lo lleva el supervisor «mintmotion-xfce»,
+# que solo funciona mientras existe este archivo.
+XFCE_ENABLED_FILE = os.path.join(CONFIG_DIR, "xfce-enabled")
+XFCE_PID_FILE = os.path.join(RUNTIME_DIR, "mintmotion-xfce.pid")
+XFCE_LOG = "~/.cache/mintmotion/mintmotion.log"
 
 # Versión anterior del programa (se llamaba «Fondo de vídeo»)
 LEGACY_UUID = "fondo-video@neo"
@@ -115,7 +122,9 @@ def _read_config(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
-            cfg.update({k: v for k, v in data.items() if k in DEFAULTS})
+            # también las claves que la ventana no muestra (sleep_after,
+            # ram_limit_mb…): hay que conservarlas al guardar
+            cfg.update(data)
     except (OSError, ValueError):
         pass
     return cfg
@@ -150,12 +159,90 @@ def _sync_settings():
     Gio.Settings.sync()
 
 
+_backend = False
+
+
+def desktop_backend():
+    """Escritorio de la sesión: "cinnamon", "xfce" o None (no soportado)."""
+    global _backend
+    if _backend is False:
+        cur = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
+        if "cinnamon" in cur:
+            _backend = "cinnamon"
+        elif "xfce" in cur:
+            _backend = "xfce"
+        elif cur:
+            _backend = None
+        else:
+            # Sin la variable (ssh, cron…): se deduce de lo que hay instalado.
+            _backend = "xfce" if (not _settings("org.cinnamon") and shutil.which("xfdesktop")) \
+                else "cinnamon"
+    return _backend
+
+
+def xfce_daemon_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    for path in (os.path.join(here, "mintmotion-xfce"),                              # código fuente
+                 os.path.join(here, "..", "lib", "mintmotion", "mintmotion-xfce"),   # PREFIX=...
+                 "/usr/lib/mintmotion/mintmotion-xfce", "/usr/local/lib/mintmotion/mintmotion-xfce"):
+        if os.path.isfile(path):
+            return os.path.normpath(path)
+    return None
+
+
+def xfce_daemon_pid():
+    """PID del supervisor de Xfce si está en marcha; si no, None."""
+    try:
+        with open(XFCE_PID_FILE, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return pid if b"mintmotion-xfce" in f.read() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _xfce_set_enabled(enabled):
+    daemon = xfce_daemon_path()
+    if enabled:
+        if not daemon:
+            return False
+        was_enabled = os.path.exists(XFCE_ENABLED_FILE)
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(XFCE_ENABLED_FILE, "w", encoding="utf-8"):
+            pass
+        if was_enabled and xfce_daemon_pid():
+            return True   # ya está en marcha: lee solo los cambios de configuración
+        try:
+            # Si queda una instancia cerrándose, la nueva espera a que termine.
+            subprocess.Popen([daemon], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+        except OSError:
+            return False
+        return True
+    try:
+        os.unlink(XFCE_ENABLED_FILE)   # el supervisor lo ve, devuelve el fondo y termina
+    except OSError:
+        pass
+    if daemon and not xfce_daemon_pid():
+        # No hay supervisor (¿se cerró a la fuerza?): si dejó el fondo de
+        # xfdesktop en su color de trabajo, se devuelve el del usuario.
+        try:
+            subprocess.run([daemon, "--restore"], stdin=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return True
+
+
 def extension_enabled():
+    if desktop_backend() == "xfce":
+        return os.path.exists(XFCE_ENABLED_FILE)
     s = _settings("org.cinnamon")
     return bool(s) and UUID in s.get_strv("enabled-extensions")
 
 
 def set_extension_enabled(enabled):
+    if desktop_backend() == "xfce":
+        return _xfce_set_enabled(enabled)
     s = _settings("org.cinnamon")
     if not s:
         return False
@@ -170,6 +257,11 @@ def set_extension_enabled(enabled):
 def extension_installed():
     return any(os.path.isdir(os.path.join(d, "cinnamon", "extensions", UUID))
                for d in (_DATA_HOME, "/usr/share", "/usr/local/share"))
+
+
+def log_hint():
+    """Dónde mirar si algo falla."""
+    return XFCE_LOG if desktop_backend() == "xfce" else "~/.xsession-errors"
 
 
 def cleanup_old_install():
@@ -228,7 +320,11 @@ def migrate_legacy():
 
 
 def static_background_ok():
-    """¿Tiene Cinnamon un fondo estático válido (imagen existente o color liso)?"""
+    """¿Tiene Cinnamon un fondo estático válido (imagen existente o color liso)?
+    En Xfce siempre lo hay: el supervisor devuelve a xfdesktop el fondo que
+    tenía y, si su imagen ya no existe, xfdesktop pinta su color de fondo."""
+    if desktop_backend() == "xfce":
+        return True
     s = _settings("org.cinnamon.desktop.background")
     if not s:
         return True  # sin esquema no podemos comprobarlo; no molestamos
@@ -293,11 +389,32 @@ def remove_user_data(delete_videos):
         pass
 
 
-def mpv_query(prop, timeout=0.5):
-    """Lee una propiedad del mpv del fondo. None si no está en marcha."""
+def mpv_sockets():
+    """Sockets IPC de los mpv en marcha: uno en Cinnamon; en Xfce, uno por monitor."""
     try:
         with open(SOCKET_POINTER, encoding="utf-8") as f:
-            path = f.read().strip()
+            return [line for line in f.read().splitlines() if line.strip()]
+    except OSError:
+        return []
+
+
+def mpv_query_all(prop, timeout=0.5):
+    """Valor de una propiedad en cada mpv que responda."""
+    values = (_mpv_query(path, prop, timeout) for path in mpv_sockets())
+    return [v for v in values if v is not None]
+
+
+def mpv_query(prop, timeout=0.5):
+    """Lee una propiedad del mpv del fondo. None si no está en marcha."""
+    for path in mpv_sockets():
+        v = _mpv_query(path, prop, timeout)
+        if v is not None:
+            return v
+    return None
+
+
+def _mpv_query(path, prop, timeout):
+    try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
             s.connect(path)
@@ -318,9 +435,9 @@ def mpv_query(prop, timeout=0.5):
 
 
 def playback_status():
-    paused = mpv_query("pause")
-    if paused is not None:
-        return "pausado" if paused else "reproduciendo"
+    paused = mpv_query_all("pause")
+    if paused:
+        return "pausado" if all(paused) else "reproduciendo"
     # mpv no está abierto: la extensión dice por qué (p. ej. «dormido»: lo ha
     # cerrado porque el escritorio lleva rato tapado)
     try:
@@ -455,28 +572,34 @@ def total_ram_kb():
 
 
 class UsageMeter:
-    """CPU y RAM de MintMotion. El único proceso que queda en marcha es mpv
-    (la ventana la crea un ayudante que termina al momento)."""
+    """CPU y RAM de MintMotion. En Cinnamon el único proceso que queda en
+    marcha es mpv (la ventana la crea un ayudante que termina al momento). En
+    Xfce hay un mpv por monitor y, además, el supervisor."""
 
     def __init__(self):
-        self.mpv_pid = None
+        self.mpv_pids = []
+        self.sockets = None
+        self.pids = []
         self.last = None   # (instante, ticks)
         self.hz = os.sysconf("SC_CLK_TCK")
         self.ncpu = os.cpu_count() or 1
         self.ram_total = total_ram_kb()
 
     def _pids(self):
-        if not (self.mpv_pid and _proc_comm(self.mpv_pid) == "mpv"):
-            pid = mpv_query("pid")
-            self.mpv_pid = pid if isinstance(pid, int) else None
-            self.last = None
-        if not self.mpv_pid:
-            return []
-        st = _proc_stat(self.mpv_pid)
-        if not st:
-            self.mpv_pid = None
-            return []
-        return [self.mpv_pid]
+        sockets = mpv_sockets()
+        if sockets != self.sockets or not self.mpv_pids or \
+                any(_proc_comm(p) != "mpv" for p in self.mpv_pids):
+            self.sockets = sockets
+            self.mpv_pids = sorted(p for p in mpv_query_all("pid") if isinstance(p, int))
+        pids = [p for p in self.mpv_pids if _proc_stat(p)]
+        if desktop_backend() == "xfce":
+            daemon = xfce_daemon_pid()   # sigue en marcha aunque mpv esté en reposo
+            if daemon:
+                pids.append(daemon)
+        if pids != self.pids:
+            self.pids = pids
+            self.last = None   # han cambiado los procesos: la CPU se mide de nuevo
+        return pids
 
     def sample(self):
         """None si no hay vídeo; si no, dict con cpu_total, cpu_core, ram_kb, ram_pct.
@@ -547,6 +670,7 @@ def run_gui():
             self.info = None
             self.ff_proc = None
             self.busy = False
+            self.last_spawn = 0      # última vez que se lanzó el supervisor de Xfce
             self._loading = True
 
             header = Gtk.HeaderBar(show_close_button=True, title=APP_NAME,
@@ -626,9 +750,10 @@ def run_gui():
             self.meter = UsageMeter()
             self.usage = Gtk.Grid(column_spacing=10, row_spacing=4, no_show_all=True)
             self.usage.set_tooltip_text(
-                _("Resource usage of MintMotion (the mpv player) compared with the whole computer. "
-                  "The work Cinnamon does to show the video happens inside Cinnamon and cannot be "
-                  "separated, so it is not included."))
+                _("Resource usage of {app} (the mpv player and, in Xfce, its supervisor) compared "
+                  "with the whole computer. The work the desktop does to compose the video on "
+                  "screen cannot be separated from the desktop itself, so it is not "
+                  "included.").format(app=APP_NAME))
             self.cpu_bar = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True,
                                         valign=Gtk.Align.CENTER)
             self.ram_bar = Gtk.LevelBar(min_value=0, max_value=100, hexpand=True,
@@ -707,10 +832,12 @@ def run_gui():
             problems = []
             if os.environ.get("XDG_SESSION_TYPE", "x11") == "wayland":
                 problems.append(_("You are in a Wayland session. The video background only works "
-                                  "in the X11 session of Cinnamon (the default one in Linux Mint and "
-                                  "LMDE)."))
-            if "cinnamon" not in os.environ.get("XDG_CURRENT_DESKTOP", "cinnamon").lower():
-                problems.append(_("{app} needs the Cinnamon desktop.").format(app=APP_NAME))
+                                  "in the X11 session (the default one in Linux Mint and LMDE)."))
+            if desktop_backend() is None:
+                problems.append(_("{app} needs the Cinnamon or Xfce desktop.").format(app=APP_NAME))
+            elif desktop_backend() == "xfce" and not xfce_daemon_path():
+                problems.append(_("The Xfce part of {app} is not installed "
+                                  "(mintmotion-xfce is missing).").format(app=APP_NAME))
             if not shutil.which("mpv"):
                 problems.append(_("mpv is missing: install it with “sudo apt install mpv”."))
             if problems:
@@ -884,11 +1011,18 @@ def run_gui():
             save_config(self.cfg)
             self.applied = dict(self.cfg)
             if not set_extension_enabled(True):
-                self.message(_("Cinnamon was not found."),
-                             _("{app} works as an extension of the Cinnamon desktop.").format(app=APP_NAME),
-                             Gtk.MessageType.ERROR)
+                if desktop_backend() == "xfce":
+                    self.message(_("The video could not be started."),
+                                 _("The Xfce part of {app} is not installed "
+                                   "(mintmotion-xfce is missing).").format(app=APP_NAME),
+                                 Gtk.MessageType.ERROR)
+                else:
+                    self.message(_("Cinnamon was not found."),
+                                 _("{app} works as an extension of the Cinnamon desktop.").format(app=APP_NAME),
+                                 Gtk.MessageType.ERROR)
                 return
             self.enabled = True
+            self.last_spawn = GLib.get_monotonic_time()
             self.refresh_status()
             GLib.timeout_add(1500, self.refresh_status)
 
@@ -932,7 +1066,7 @@ def run_gui():
 
         def on_uninstall(self, *_args):
             r = self.ask(_("Uninstall {app}?").format(app=APP_NAME),
-                         _("The program, its Cinnamon extension and all its settings will be removed. "
+                         _("The program and all its settings will be removed. "
                            "The desktop will go back to a static background.") + "\n\n<b>" +
                          _("Your videos will not be touched.") + "</b>",
                          [(_("_Cancel"), Gtk.ResponseType.CANCEL, None),
@@ -996,7 +1130,7 @@ def run_gui():
                        else GLib.markup_escape_text(out.strip()[-500:]))
                 self.uninstall_failed(why)
                 return
-            set_extension_enabled(False)  # Cinnamon la descarga y cierra el vídeo
+            set_extension_enabled(False)  # Cinnamon la descarga y cierra el vídeo (en Xfce, el supervisor)
             self.enabled = False
             remove_user_data(self.delete_videos)
             self.busy = False
@@ -1014,10 +1148,22 @@ def run_gui():
 
         # ----- estado -----
 
+        def revive_supervisor(self):
+            """Xfce: si el vídeo está activado pero su supervisor no está en
+            marcha (se cerró a la fuerza), se vuelve a lanzar. Como mucho una
+            vez cada 15 s, por si no llega a arrancar."""
+            if not self.enabled or desktop_backend() != "xfce" or xfce_daemon_pid():
+                return
+            now = GLib.get_monotonic_time()
+            if now - self.last_spawn > 15 * 1000000:
+                self.last_spawn = now
+                set_extension_enabled(True)
+
         def refresh_status(self):
             if self.busy:
                 return True
             self.enabled = extension_enabled()
+            self.revive_supervisor()
             st = playback_status()
             esc = GLib.markup_escape_text
             if not self.enabled:
@@ -1033,10 +1179,10 @@ def run_gui():
                       "to free its memory. When uncovered, it continues where it was."))
             elif st == "error":
                 txt = "<span foreground='#c01c28'>●</span> " + esc(
-                    _("The player has failed several times (check ~/.xsession-errors)."))
+                    _("The player has failed several times (check {log}).").format(log=log_hint()))
             else:
                 txt = "<span foreground='#c01c28'>●</span> " + esc(
-                    _("Starting… (if this does not change, check ~/.xsession-errors)"))
+                    _("Starting… (if this does not change, check {log})").format(log=log_hint()))
             if self.pending() and self.video_ok():
                 txt += "\n<span foreground='#1c71d8'>" + esc(
                     _("There are changes not applied yet: press “Apply”.")) + "</span>"
@@ -1158,8 +1304,8 @@ def run_gui():
 def main():
     p = argparse.ArgumentParser(
         prog="mintmotion",
-        description=_("{app}: video as desktop background in Cinnamon. Without arguments it "
-                      "opens the settings window.").format(app=APP_NAME))
+        description=_("{app}: video as desktop background in Cinnamon and Xfce. Without arguments "
+                      "it opens the settings window.").format(app=APP_NAME))
     p.add_argument("--video", help=_("video to use as background (it also enables it)"))
     p.add_argument("--fit", choices=[k for k, _t in FITS], help=_("screen fit"))
     p.add_argument("--quality", choices=[k for k, _t in QUALITIES], help=_("scaling quality"))
@@ -1208,7 +1354,11 @@ def main():
         save_config(cfg)
     if args.enable or args.disable:
         if not set_extension_enabled(bool(args.enable)):
-            print(_("Cinnamon was not found (org.cinnamon schema)."), file=sys.stderr)
+            if desktop_backend() == "xfce":
+                print(_("The Xfce part of {app} is not installed "
+                        "(mintmotion-xfce is missing).").format(app=APP_NAME), file=sys.stderr)
+            else:
+                print(_("Cinnamon was not found (org.cinnamon schema)."), file=sys.stderr)
             return 1
     if args.status:
         yes, no = _("yes"), _("no")

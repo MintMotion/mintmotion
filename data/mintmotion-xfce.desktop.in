@@ -1,0 +1,17 @@
+[Desktop Entry]
+Type=Application
+Name=MintMotion
+GenericName=Video wallpaper
+GenericName[es]=Vídeo como fondo de escritorio
+GenericName[fr]=Fond d’écran vidéo
+GenericName[zh_CN]=视频桌面背景
+Comment=Plays the video chosen in MintMotion as the desktop background (does nothing if no video is set)
+Comment[es]=Reproduce como fondo de escritorio el vídeo elegido en MintMotion (no hace nada si no hay vídeo puesto)
+Comment[fr]=Lit en fond d’écran la vidéo choisie dans MintMotion (ne fait rien si aucune vidéo n’est définie)
+Comment[zh_CN]=将在 MintMotion 中选择的视频作为桌面背景播放（未设置视频时不做任何事）
+Exec=@LIBDIR@/mintmotion-xfce --autostart
+TryExec=@LIBDIR@/mintmotion-xfce
+Icon=mintmotion
+Terminal=false
+OnlyShowIn=XFCE;
+NoDisplay=true

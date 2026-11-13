@@ -1,23 +1,29 @@
 # MintMotion
 
-**Vídeo como fondo de escritorio para Linux Mint y LMDE (Cinnamon).** *by Sombra*
+**Vídeo como fondo de escritorio para Linux Mint y LMDE (Cinnamon y Xfce).** *by Sombra*
 
 [English version](README.md) · [Guía para desarrolladores (en inglés)](docs/DEVELOPERS.md) · [▶ Vídeo](https://youtu.be/W-0gZbKyELo)
 
-MintMotion reproduce un vídeo como fondo de escritorio. El vídeo se dibuja dentro
-de la capa de fondo del propio Cinnamon: por debajo de los iconos del escritorio,
-los desklets, los paneles y todas las ventanas. No roba clics ni teclado.
+MintMotion reproduce un vídeo como fondo de escritorio, por debajo de los iconos
+del escritorio, los paneles y todas las ventanas. No roba clics ni teclado.
+
+- En **Cinnamon** el vídeo se dibuja dentro de la capa de fondo del propio
+  Cinnamon (también por debajo de los desklets).
+- En **Xfce** va en una ventana propia, justo encima del escritorio, y los
+  iconos se vuelven a pintar encima con su transparencia real. Véase
+  [En Xfce](#en-xfce).
 
 - **Se pausa solo** cuando el escritorio queda tapado del todo: una ventana
   maximizada o a pantalla completa, varias ventanas que entre todas lo cubren, la
-  vista Expo o el salvapantallas. Sigue reproduciéndose mientras se vea aunque
+  vista Expo de Cinnamon o el salvapantallas. Sigue reproduciéndose mientras se vea aunque
   sea un trozo. En pausa apenas usa CPU.
 - **Entra en reposo** si el escritorio sigue tapado 2 minutos: cierra el
   reproductor y libera toda su memoria, incluida la que reserva el driver de la
   gráfica. En pantalla queda el último fotograma y, al destapar el escritorio, el
   vídeo sigue en el mismo punto, sin pantallazo negro.
 - **Decodificación por hardware** (VA-API, VDPAU o NVDEC) cuando el equipo la
-  tiene. Sin sonido y con un solo decodificador para todos los monitores.
+  tiene. Sin sonido. En Cinnamon, un solo decodificador para todos los monitores;
+  en Xfce, uno por monitor, y cada monitor se pausa por separado.
 - **Se repara solo.** Si el reproductor se cuelga o su memoria crece de forma
   anormal, lo reinicia en el mismo punto.
 - **Ventana propia** para elegir el vídeo y las opciones, con los botones
@@ -25,16 +31,21 @@ los desklets, los paneles y todas las ventanas. No roba clics ni teclado.
 - **Idiomas:** español, inglés, francés y chino simplificado. Sigue el idioma del
   sistema; con cualquier otro idioma sale en inglés.
 
-> **Estado del proyecto.** Funciona, y está medido en un equipo real (NVIDIA) y en
-> un contenedor de pruebas. **No** está probado con gráficas AMD o Intel, con
-> varios monitores ni en otros escritorios o distribuciones. Véase
+> **Estado del proyecto.** En Cinnamon funciona, y está medido en un equipo real
+> (NVIDIA) y en un contenedor de pruebas. El soporte de **Xfce es nuevo en la
+> versión 1.5.0** y de momento solo está probado en una sesión Xfce 4.18 virtual,
+> sin tarjeta gráfica. **No** está probado con gráficas AMD o Intel, con varios
+> monitores reales ni en otros escritorios o distribuciones. Véase
 > [Qué está probado](#qué-está-probado) y [Qué falta por probar](#qué-falta-por-probar).
 > Se agradecen informes y colaboraciones.
 
 ## Requisitos
 
-- Linux Mint 22.x o LMDE 6/7 con **Cinnamon 6.0 o superior**, en la sesión
-  **X11** (la normal). No funciona en Wayland.
+- Linux Mint 22.x o LMDE 6/7, en la sesión **X11** (la normal). No funciona en
+  Wayland. Con uno de estos escritorios:
+  - **Cinnamon 6.0 o superior**, o
+  - **Xfce 4.18** con su gestor de ventanas (xfwm4) y su escritorio (xfdesktop),
+    que es lo que trae Linux Mint 22.x Xfce.
 - El paquete instala lo que necesita: `mpv python3-gi python3-xlib gir1.2-gtk-3.0 ffmpeg`.
 
 ## Instalación
@@ -42,12 +53,13 @@ los desklets, los paneles y todas las ventanas. No roba clics ni teclado.
 Con el paquete `.deb`:
 
 ```bash
-sudo apt install ./mintmotion_1.4.0_all.deb
+sudo apt install ./mintmotion_1.6.0_all.deb
 ```
 
-Abre **MintMotion** desde el menú (Preferencias). No hace falta reiniciar
-Cinnamon. Si **actualizas** desde una versión anterior, cierra la sesión y vuelve
-a entrar después, para que Cinnamon cargue la extensión nueva.
+Abre **MintMotion** desde el menú (Preferencias en Cinnamon, Configuración en
+Xfce). No hace falta reiniciar el escritorio. Si **actualizas** desde una versión
+anterior, cierra la sesión y vuelve a entrar después, para que Cinnamon cargue la
+extensión nueva (o, en Xfce, para que arranque el supervisor nuevo).
 
 Desde el código fuente (hace falta `gettext` para compilar las traducciones):
 
@@ -77,15 +89,16 @@ make deb                   # genera dist/mintmotion_<versión>_all.deb
 | Decodificación por hardware | Activado por defecto. |
 
 Debajo del estado hay dos barras con el **consumo real de MintMotion** (el
-reproductor mpv, único proceso que queda en marcha), actualizadas cada 2
+reproductor mpv y, en Xfce, también su supervisor), actualizadas cada 2
 segundos. Las barras son proporcionales al valor: un 2 % de la RAM ocupa un 2 % de
 la barra.
 
 - **CPU:** porcentaje del total del equipo y de un núcleo.
 - **RAM:** memoria propia del reproductor (PSS), en MB y en porcentaje del total.
 
-No incluye el trabajo que hace Cinnamon para componer el escritorio, porque no se
-puede separar del propio Cinnamon.
+No incluye el trabajo que hace el escritorio (Cinnamon, o el compositor de Xfce)
+para componer el vídeo en pantalla, porque no se puede separar del propio
+escritorio.
 
 **Optimizar para mi pantalla** crea una copia del vídeo a la resolución exacta de
 tu monitor (H.264, 30 fps como máximo, sin audio), que es lo más ligero de
@@ -111,11 +124,50 @@ mintmotion --disable
 sudo apt purge mintmotion
 ```
 
+## En Xfce
+
+Xfce no permite dibujar dentro de su fondo de escritorio, así que MintMotion
+trabaja de otra manera:
+
+- **Tu fondo de escritorio se cambia mientras hay vídeo y luego se devuelve.**
+  Para distinguir los iconos, MintMotion pone como fondo de Xfce un color liso
+  casi negro mientras el vídeo está puesto. Tu imagen, su estilo y tu color se
+  guardan y vuelven solos al pulsar **Quitar vídeo**, al cerrar la sesión y al
+  desinstalar el paquete. Si cambias el fondo en los ajustes de Xfce con el vídeo
+  puesto, se recuerda tu elección y es la que vuelve después.
+- **Los iconos se ven como con un fondo estático** (desde la versión 1.6.0), con
+  sus bordes suavizados, las sombras de los textos y el rectángulo de selección
+  translúcido. Para ello hace falta el compositor de Xfce activado (Ajustes del
+  gestor de ventanas → Compositor), que es lo normal, u otro compositor (picom,
+  Compton). MintMotion mide la transparencia de cada píxel poniendo un instante
+  el fondo de xfdesktop en negro y en blanco, por debajo del vídeo, sin que se
+  vea. Al cambiar algo en el escritorio (seleccionar, arrastrar, un icono
+  nuevo), la transparencia de lo que ha cambiado es aproximada durante unas
+  décimas de segundo.
+- **Sin compositor**, los iconos se recortan como en la versión 1.5.0: se ven
+  con un borde oscuro fino y las sombras suaves quedan duras. Si activas o
+  desactivas el compositor con el vídeo puesto, MintMotion cambia de un modo a
+  otro solo.
+- **Queda un proceso más en marcha:** el supervisor `mintmotion-xfce`, que hace
+  lo que en Cinnamon hace la extensión. Arranca solo al iniciar sesión si hay un
+  vídeo puesto.
+- **Un reproductor por monitor.** Cada monitor se pausa y entra en reposo por
+  separado; a cambio, con dos monitores a la vista se decodifica el vídeo dos
+  veces.
+- Si algo falla, el registro está en `~/.cache/mintmotion/mintmotion.log`.
+
 ## Cuánto consume
 
-MintMotion deja **un solo proceso en marcha: mpv**. El ayudante que crea la
-ventana termina al momento, así que no queda Python en memoria. Mientras el
-escritorio lleva más de 2 minutos tapado, no queda **nada** de MintMotion en marcha.
+En Cinnamon, MintMotion deja **un solo proceso en marcha: mpv**. El ayudante que
+crea la ventana termina al momento, así que no queda Python en memoria. Mientras
+el escritorio lleva más de 2 minutos tapado, no queda **nada** de MintMotion en
+marcha.
+
+En Xfce queda además el supervisor (Python): **unos 32 MB** de RAM (PSS) con un
+monitor de 1920×1080 y el compositor activado (23 MB más 8 MB por la capa de
+iconos de cada monitor; 22-23 MB sin compositor), medidos en la sesión de pruebas, y sin consumo de CPU mientras no cambia nada en el
+escritorio (0 centésimas de segundo de CPU en 10 segundos). Con el escritorio
+tapado más de 2 minutos mpv se cierra igual; el supervisor sigue en marcha.
 
 Medido en el equipo del autor (LMDE 7, NVIDIA GeForce GTX 1650, driver
 550.163.01, mpv 0.40.0, 12 núcleos lógicos, 15,5 GB de RAM, monitor de
@@ -152,16 +204,40 @@ decodificación.
   los cuatro idiomas. También se probaron allí la ventana, sus botones, las
   variantes de la desinstalación y las barras de consumo.
 
+- **Sesión Xfce de pruebas** con los paquetes de Ubuntu 24.04, que son la base de
+  Linux Mint 22.x (xfwm4 4.18.0, xfdesktop 4.18.1, xfce4-panel 4.18.4, mpv 0.37),
+  sobre un servidor X virtual (Xvfb) con gráficos por software:
+  `tests/smoke-test-xfce.sh` (46 comprobaciones) pasa con el compositor de xfwm4
+  activado y desactivado. Con el compositor, el escritorio con un vídeo de
+  fotograma fijo se ha comparado píxel a píxel con ese mismo fotograma puesto
+  como fondo estático: el 99,95 % de los píxeles son idénticos y el resto
+  difiere en 1 nivel de 255. También se ha probado a activar y desactivar el
+  compositor con el vídeo puesto. Cubre lo mismo que la prueba de Cinnamon y, además, que
+  los iconos se ven sobre el vídeo píxel a píxel, que el clic derecho llega al
+  escritorio, el reinicio de xfdesktop, la muerte del supervisor y que el fondo
+  de Xfce vuelve a quedar como estaba. `tests/multimonitor-test-xfce.sh` (14
+  comprobaciones) prueba dos monitores virtuales con pausa independiente.
+- **Cinnamon 6.0.4** (paquetes de Ubuntu 24.04) sobre Xvnc: la prueba de Cinnamon
+  (28 comprobaciones) pasa con la versión 1.5.0.
+
 ## Qué falta por probar
+
+- **Xfce en un equipo real:** todo lo de Xfce se ha probado sin tarjeta gráfica.
+  Falta comprobarlo con decodificación por hardware, con monitores reales y en un
+  Linux Mint Xfce instalado.
+- **Xfce 4.20** (LMDE 7 con Xfce, futuro Linux Mint 23) y **Xfce 4.16** (Linux
+  Mint 21). El código de xfdesktop 4.20 se ha revisado y usa el mismo esquema de
+  ajustes y de ventanas, pero no se ha ejecutado.
+- **Pausa con la pantalla apagada o con la sesión inactiva** en Xfce (bloqueo con
+  light-locker, cambio de usuario): está programada, pero el servidor de pruebas
+  no permite comprobarla.
 
 - **Gráficas AMD e Intel** (decodificación VA-API). Debería funcionar, porque el
   decodificador lo elige mpv, pero nadie lo ha medido todavía.
 - **Portátiles con dos gráficas** (por ejemplo Intel + NVIDIA).
 - **Varios monitores.**
 - **Cinnamon 6.8.**
-- **Otros escritorios** (GNOME, KDE, Xfce, MATE…): no están soportados. El
-  programa depende del compositor de Cinnamon (Muffin) para poner el vídeo debajo
-  de los iconos.
+- **Otros escritorios** (GNOME, KDE, MATE…): no están soportados.
 - **Otras distribuciones** con Cinnamon (Fedora, Arch, Ubuntu Cinnamon…): sin
   probar. El paquete `.deb` es para sistemas basados en Debian; `make install`
   debería funcionar en otras si están las dependencias.

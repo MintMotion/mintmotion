@@ -16,6 +16,7 @@ User documentation: [README.md](../README.md) (English) ·
 
 - [Repository layout](#repository-layout)
 - [Architecture](#architecture)
+- [Architecture in Xfce](#architecture-in-xfce)
 - [Files at run time](#files-at-run-time)
 - [Settings](#settings)
 - [The mpv command line](#the-mpv-command-line)
@@ -38,11 +39,12 @@ User documentation: [README.md](../README.md) (English) ·
 |---|---|
 | `src/mintmotion` | Settings application (Python 3 + GTK 3) and command-line interface. |
 | `src/mintmotion-renderer` | One-shot helper (Python 3 + python-xlib): creates the X11 window and prints the mpv options, then exits. |
+| `src/mintmotion-xfce` | Xfce supervisor (Python 3 + python-xlib + GLib/Gio): does in Xfce what the extension does in Cinnamon. Stays running while a video is set. |
 | `extension/mintmotion@sombra/` | Cinnamon extension (GJS): starts and supervises mpv and places the video in the background layer. |
-| `data/` | Desktop launcher (translated) and icon. |
+| `data/` | Desktop launcher (translated), icon and the Xfce autostart entry (`mintmotion-xfce.desktop.in`). |
 | `po/` | Translation template (`mintmotion.pot`) and catalogs (`es.po`, `fr.po`, `zh_CN.po`). `translations.py` and `make-po.py` were used to create the first catalogs. |
-| `packaging/` | `build-deb.sh`, Debian `control` template, `postinst`, `postrm`. |
-| `tests/` | Docker image with the LMDE 7 packages, session start script and the automatic test. |
+| `packaging/` | `build-deb.sh`, Debian `control` template, `postinst`, `prerm`, `postrm`. |
+| `tests/` | Cinnamon: Docker image with the LMDE 7 packages, `start-session.sh`, `smoke-test.sh`. Xfce: `Dockerfile.xfce`, `start-session-xfce.sh`, `smoke-test-xfce.sh`, `multimonitor-test-xfce.sh`. |
 | `Makefile` | `make`, `install`, `uninstall`, `deb`, `pot`, `update-po`, `clean`. |
 
 ## Architecture
@@ -95,6 +97,137 @@ User documentation: [README.md](../README.md) (English) ·
    terminated, then the window is destroyed. Renderers of versions ≤ 1.2, which
    stayed alive, are terminated too.
 
+## Architecture in Xfce
+
+The settings application is the same. It looks at `XDG_CURRENT_DESKTOP`
+(`desktop_backend()` in `src/mintmotion`): with Cinnamon it enables the
+extension; with Xfce it creates `~/.config/mintmotion/xfce-enabled` and starts
+`mintmotion-xfce`. The extension and the renderer's window code are not used in
+Xfce; the supervisor only asks the renderer for the mpv options
+(`--print-mpv-args`).
+
+```
+ MintMotion window / CLI  ──writes──▶  ~/.config/mintmotion/config.json
+        (src/mintmotion)   ──creates──▶ ~/.config/mintmotion/xfce-enabled
+                                                  │ watched
+                                                  ▼
+                            mintmotion-xfce (Python, stays running)
+               one per monitor │                       │ xfconf (D-Bus)
+                               ▼                       ▼
+            X11 window (desktop type, "below")   xfdesktop backdrop = key colour
+            + mpv --wid=<window>                 (user's values saved, then restored)
+                               ▲
+                               └── cut out (SHAPE) where xfdesktop draws icons
+```
+
+**Why it is different.** xfwm4 has no extension system and cannot clone a
+window, and the xfdesktop window (wallpaper + icons) is an opaque 24-bit window
+in both Xfce 4.18 and 4.20: its “transparent” colour style does not make it
+see-through. So the video cannot go *under* xfdesktop.
+
+1. **Window and stacking.** One X11 window per monitor, of type
+   `_NET_WM_WINDOW_TYPE_DESKTOP` with `_NET_WM_STATE_BELOW`. xfwm4 puts it in
+   its “below” layer: always above xfdesktop (desktop layer) and always below
+   panels and every other window, with no decorations or shadow, out of the
+   taskbar, Alt+Tab and “show desktop”, and without constraining it to the work
+   area. The window is created unmapped and mapped once mpv is drawing. After
+   xfwm4 reparents it, the empty input region is set again (xfwm4 only copies
+   it to its frame on `ShapeNotify`) and the window is lowered within its layer,
+   so other “always below” windows stay above the video.
+2. **Icons, with a compositor (1.6.0).** When a compositing manager owns
+   `_NET_WM_CM_S<n>`, each monitor gets a second window: 32-bit (ARGB), same
+   type, state and empty input region as the video window, stacked right above
+   it (class `mintmotion-icons`). The video window is not shaped. xfdesktop
+   draws every pixel as `colour·α + backdrop·(1 − α)`, so with a black backdrop
+   its window holds the premultiplied colour, and with a white one the same
+   plus `255·(1 − α)`: `α = 255 − (white − black)`. The supervisor keeps the
+   backdrop black (`rgba1` = 0, 0, 0). When DAMAGE reports a repaint, the
+   changed 64-row strips are copied to the layer at once with a provisional
+   alpha (unchanged pixels keep theirs; changed ones take the larger of their
+   old alpha and their brightest channel, or 0 if they turned black) and
+   marked pending. After 150 ms without changes the backdrop is set to white,
+   the pending strips are captured as soon as xfdesktop has repainted (about
+   25 ms), it is set back to black, and the exact alpha is written. All of
+   this happens under the opaque video window. A strip that changed while it
+   was being measured is measured again (three times at most). The arithmetic
+   uses Python big integers with one value per 16-bit lane (`Lanes`,
+   `alpha_exact`, `alpha_provisional`). With subpixel text rendering the three
+   channels give different alphas and a window has only one: green counts
+   double in the mean. `_poll` switches between this mode and the next one if
+   the compositor appears or goes away, and checks that the layer is still
+   right above its video. `MINTMOTION_NO_ALPHA=1` forces the cut-out mode.
+   The layer's bounding shape covers only the 64-pixel cells that hold
+   something, so the compositor does not blend a screen-sized layer with every
+   video frame. Desktop-type windows that are not xfdesktop's (conky and
+   similar; told apart by `WM_CLASS`) are pasted over the xfdesktop content
+   and never trigger a measurement: 32-bit ones bring their own alpha, and in
+   the others black shows the video. If measurements become frequent (8 in
+   10 s), the wait before the next one grows from 150 ms to 1.5 s.
+   **Icons, without a compositor.** While a monitor has video, its xfdesktop backdrop is switched
+   through xfconf to a solid key colour, RGB (2, 1, 3) (`color-style=0`,
+   `image-style=0`, `rgba1`; properties
+   `/backdrop/screen<N>/monitor<output>/workspace<N>/…`). The supervisor reads
+   the xfdesktop window with `GetImage`, and every pixel that differs from the
+   key is an icon, a label, a selection… A 1-bit mask is built from that and
+   set as the bounding shape of the video window (`ShapeMask`), so those pixels
+   show xfdesktop instead of the video. The mask is recomputed, in 64-row
+   strips, when the DAMAGE extension reports that xfdesktop has repainted; a
+   strip whose pixels have not changed is skipped. The comparison is done with
+   Python big integers (no per-pixel loop, no numpy). If less than 1 % of a
+   monitor shows the key, the backdrop is assumed not to be keyed and the video
+   is shown whole. Any other window of type desktop (conky and similar) is
+   treated the same way.
+3. **Clicks.** The video window has an empty input region, so every click,
+   wheel turn and drag goes to xfdesktop: its menu, icons, rubber band and
+   drag-and-drop keep working.
+4. **Backdrop backup.** The original values of the three properties are stored
+   in `xfce-backdrop.json` before they are changed and restored when the video
+   is removed, when the X server goes away (logout), on `SIGTERM` and, for a
+   package removal, by `prerm`. If the supervisor is killed, the file survives
+   and `mintmotion --disable` (or `mintmotion-xfce --restore`) puts the backdrop
+   back. A property that did not exist is first set to xfdesktop's default and
+   then reset, because xfdesktop 4.18 does not notice a property being removed.
+   A change made by the user in the Xfce settings while the video is on updates
+   the backup and the key is applied again.
+5. **Without a compositor.** The X server does not keep the contents of covered
+   windows. When no compositing manager owns `_NET_WM_CM_S<n>`, the supervisor
+   asks for automatic redirection (Composite) of xfdesktop's top-level window,
+   so its icons can still be read under the video, and of the video windows, so
+   they keep their last frame while mpv sleeps.
+6. **Players.** One mpv per monitor (xfwm4 cannot show one window in two
+   places). Each has its own IPC socket, pause, sleep, watchdogs and restart
+   limit; they are the same as in the extension, ported to Python. mpv is
+   started through `setpriv --pdeathsig KILL`.
+7. **Pause.** Per monitor. The area to cover is the monitor minus the panels'
+   struts (`_NET_WM_STRUT_PARTIAL`; a strut counts only on the monitor where it
+   ends). Covering windows are the managed `NORMAL`, `DIALOG` and `UTILITY`
+   ones that are viewable, on the current workspace, not minimized or shaded and
+   without `_NET_WM_WINDOW_OPACITY`, read from `_NET_CLIENT_LIST_STACKING`, plus
+   unmanaged 24-bit windows that cover a whole monitor (lockers, screensavers).
+   Windows with an alpha channel count like the rest: most are opaque
+   (xfce4-terminal always uses a 32-bit window) and there is no reliable way to
+   tell. If xfwm4's “opacity of inactive windows” is below 100, only the focused
+   window counts. All players pause on `ActiveChanged` from any
+   `*.ScreenSaver` D-Bus interface (xfce4-screensaver), when DPMS reports the
+   screen off and when logind marks the session inactive.
+8. **Start and stop.** `/etc/xdg/autostart/mintmotion-xfce.desktop`
+   (`OnlyShowIn=XFCE`) starts the supervisor at login; it exits at once if
+   `xfce-enabled` does not exist. An X selection (`_MINTMOTION_S<n>`) keeps a
+   single instance per screen. Removing `xfce-enabled` makes it stop in order:
+   the video covers the icons, the backdrop is restored, it waits (up to 3 s)
+   until xfdesktop has repainted, and then it removes the windows. The settings
+   window starts it again if it finds it dead while the video is enabled.
+
+Measured in the test session (1920×1080, software X server): building the whole
+mask takes 37–52 ms, a full repaint of xfdesktop with no changes 7–20 ms (39 ms
+at most), an icon added or removed 7–11 ms. The supervisor uses 22–23 MB (PSS;
+about 28 MB RSS), of which about 13 MB are Python with GLib/Gio and python-xlib
+loaded, and no CPU while nothing changes (0 clock ticks in 10 s). After building
+a mask it returns the temporary memory to the system (`malloc_trim`).
+
+`MINTMOTION_DEBUG=1` in the supervisor's environment adds mask and memory
+figures to the log.
+
 ## Files at run time
 
 | Path | Written by | Contents |
@@ -102,17 +235,23 @@ User documentation: [README.md](../README.md) (English) ·
 | `~/.config/mintmotion/config.json` | Application / CLI (atomic write) | Settings (see below). |
 | `~/.local/share/mintmotion/` | Application | Videos created with “Optimize for my screen”. |
 | `~/.cache/mintmotion/preview.png` | Application | Thumbnail shown in the window. |
-| `$XDG_RUNTIME_DIR/mintmotion.socket` | Extension | Path of the current mpv IPC socket (a pointer file, not the socket). |
+| `$XDG_RUNTIME_DIR/mintmotion.socket` | Extension / supervisor | Path of the current mpv IPC socket (a pointer file, not the socket). In Xfce, one path per line (one mpv per monitor). |
 | `$XDG_RUNTIME_DIR/mintmotion-<time>-<n>.sock` | mpv | IPC socket of each player instance. |
-| `$XDG_RUNTIME_DIR/mintmotion.state` | Extension | `reproduciendo`, `pausado`, `dormido`, `error` or `arrancando`. Used by the window when mpv is not running. |
+| `$XDG_RUNTIME_DIR/mintmotion.state` | Extension / supervisor | `reproduciendo`, `pausado`, `dormido`, `error` or `arrancando`. Used by the window when mpv is not running. In Xfce it is the most active state among the monitors. |
 | `/usr/share/locale/<lang>/LC_MESSAGES/mintmotion.mo` | Package | Compiled translations. |
+| `~/.config/mintmotion/xfce-enabled` | Application (Xfce) | Empty file: the video is enabled. The supervisor only runs while it exists. |
+| `~/.config/mintmotion/xfce-backdrop.json` | Supervisor (Xfce) | The user's xfdesktop backdrop values, to restore them. Exists only while the key colour is applied. |
+| `$XDG_RUNTIME_DIR/mintmotion-xfce.pid` | Supervisor (Xfce) | Its PID. |
+| `~/.cache/mintmotion/mintmotion.log` | Supervisor (Xfce) | Log, including what mpv prints. Trimmed when it passes 256 KB. |
+| `/etc/xdg/autostart/mintmotion-xfce.desktop` | Package | Starts the supervisor in Xfce sessions. |
 
-Logs go to Cinnamon's log (`~/.xsession-errors`), prefixed with `[mintmotion]`.
+In Cinnamon, logs go to Cinnamon's log (`~/.xsession-errors`), prefixed with
+`[mintmotion]`. In Xfce they go to `~/.cache/mintmotion/mintmotion.log`.
 
 ## Settings
 
-`~/.config/mintmotion/config.json`. The extension watches the file and applies
-changes without restarting Cinnamon.
+`~/.config/mintmotion/config.json`. The extension (or the Xfce supervisor)
+watches the file and applies changes without restarting anything.
 
 | Key | Default | Shown in the window | Meaning |
 |---|---|---|---|
@@ -127,7 +266,7 @@ changes without restarting Cinnamon.
 | `gpu_env` | `true` | no | On computers whose only graphics card is NVIDIA, stop mpv from loading the Mesa drivers. |
 
 The hidden keys have to be edited by hand. The application keeps them when it
-saves.
+saves (up to 1.4.0 it dropped them; fixed in 1.5.0).
 
 ## The mpv command line
 
@@ -163,7 +302,8 @@ or AMD graphics, and hybrid laptops, are not affected.
 
 ## Watchdogs and recovery
 
-All of them are in `extension.js`.
+All of them are in `extension.js`; `mintmotion-xfce` has the same ones, per
+monitor.
 
 | Watchdog | How it works |
 |---|---|
@@ -174,6 +314,7 @@ All of them are in `extension.js`.
 | Memory | Once a minute the mpv PSS is read from `/proc/<pid>/smaps_rollup`. The reference is taken 2 minutes after start. mpv is restarted at the same position if it grows beyond `max(1.5 × reference, reference + 100 MB)`, or beyond `ram_limit_mb` if that is set. It is a guard against leaks in some drivers during continuous playback. |
 | Kill | `SIGTERM`, then `SIGKILL` after 3 s. |
 | Cinnamon crash | `setpriv --pdeathsig KILL` kills mpv. On the next start, leftover windows and processes are retired (see *Instance token*). |
+| Xfce supervisor killed | `setpriv --pdeathsig KILL` kills its mpv and the X server destroys its windows (they belong to its connection). xfdesktop is left with the key colour until the supervisor starts again or the video is disabled. |
 
 ## Memory
 
@@ -325,6 +466,10 @@ make deb          # → dist/mintmotion_<version>_all.deb
 The version is set in `Makefile`, `packaging/build-deb.sh` and
 `extension/mintmotion@sombra/metadata.json`.
 
+`make install` also installs `$(SYSCONFDIR)/xdg/autostart/mintmotion-xfce.desktop`
+(`SYSCONFDIR` is `/etc` by default), with the path of the supervisor for the
+chosen `PREFIX`.
+
 ## Testing
 
 The test environment is a Docker image with Debian trixie and the LMDE 7 “gigi”
@@ -344,7 +489,7 @@ docker rm -f mm-test
 Use `--init`: without an init process, zombie processes accumulate in the
 container and the process counts in the test are wrong.
 
-`tests/smoke-test.sh` makes 28 checks:
+`tests/smoke-test.sh` (Cinnamon) makes 28 checks:
 
 - Playback: starts within 20 s, a single mpv, no Python process left, a single
   window, the background is not black.
@@ -361,38 +506,117 @@ container and the process counts in the test are wrong.
 What cannot be tested in the container: hardware decoding, the effect of
 `gpu_env`, real GPU drivers, several physical monitors.
 
+### Xfce
+
+The Xfce test environment is Ubuntu 24.04, whose packages are the base of Linux
+Mint 22.x (xfwm4 4.18.0, xfdesktop 4.18.1, xfce4-panel 4.18.4, mpv 0.37,
+python3-xlib 0.33). It runs a real Xfce session (xfsettingsd, xfwm4 with its
+compositor, xfdesktop with icons and the panel) on Xvfb.
+
+```bash
+docker build -t mint22-xfce-test -f tests/Dockerfile.xfce tests/
+make deb
+docker run -d --init --name mm-xfce -v "$PWD":/repo mint22-xfce-test sleep infinity
+docker exec mm-xfce apt-get install -y /repo/dist/mintmotion_*_all.deb
+docker exec -u neo mm-xfce bash /repo/tests/start-session-xfce.sh
+docker exec -u neo mm-xfce bash /repo/tests/smoke-test-xfce.sh
+docker rm -f mm-xfce
+```
+
+`start-session-xfce.sh` accepts `COMPOSITOR=off` (xfwm4 without its compositor)
+and `MONITORS=2` (two virtual monitors, for `multimonitor-test-xfce.sh`). Both
+scripts also run outside Docker on a machine with those packages;
+`MINTMOTION=/path/to/src/mintmotion` tests the source tree without installing.
+
+`tests/smoke-test-xfce.sh` makes 46 checks. Besides those of the Cinnamon test:
+
+- Icons: the screen is compared pixel by pixel with the xfdesktop window in the
+  icon area (what xfdesktop draws must be on screen; the rest must be video),
+  also after adding and removing a file and after sleep.
+- The video window is right above the desktop window in the stacking order, and
+  a right click on the video opens the xfdesktop menu.
+- The application keeps the hidden settings keys when it saves.
+- xfdesktop is closed and started again: the icons come back over the video.
+- The supervisor is killed with `SIGKILL`: its mpv dies, its window disappears,
+  and `mintmotion --enable` brings back a single player. With the supervisor
+  dead, `mintmotion --disable` restores the xfdesktop backdrop.
+- Disabling leaves no process, no window, no work files, and the xfdesktop
+  backdrop exactly as it was (`xfconf-query` listing before and after).
+
+`tests/multimonitor-test-xfce.sh` makes 14 checks: one mpv and one window per
+monitor, each on its monitor, and independent pause. In that session xfwm4 only
+knows the first monitor (the second has no real output), so the second is
+covered with an unmanaged window.
+
+These tests were run directly on Ubuntu 24.04 with the commands of the scripts;
+`tests/Dockerfile.xfce` has the same package list, but the image itself has not
+been built. mpv used its software output (`--vo=x11`) there, as it does in the
+Cinnamon container.
+
+Not testable in that session: DPMS (Xvfb has no DPMS extension), logind (no
+system bus), hardware decoding, real monitors.
+
 ## What is tested and what is not
 
 | Area | Status |
 |---|---|
 | LMDE 7, Cinnamon 6.6, X11 | Tested (container and real computer). |
+| Cinnamon 6.0.4 (Ubuntu 24.04 packages), X11 | Tested with `smoke-test.sh` on Xvnc (version 1.5.0). |
+| Xfce 4.18 (Ubuntu 24.04 packages = Linux Mint 22.x base), X11 | Tested in a virtual session, compositor on and off: `smoke-test-xfce.sh`, `multimonitor-test-xfce.sh`. **Not tested** on a real computer. |
+| Xfce 4.20 (LMDE 7 with Xfce, Linux Mint 23), Xfce 4.16 (Linux Mint 21) | **Not tested.** xfdesktop 4.20 was checked by reading its code: same xfconf properties, desktop-type windows (one per monitor), opaque. |
+| Xfce: pause by DPMS and by inactive session (logind) | **Not tested** (not available in the test session). |
+| Xfce with another window manager or desktop program (Compiz, Marco, nemo-desktop…) | **Not tested.** The layer logic is xfwm4's. |
 | NVIDIA (GTX 1650, driver 550) | Tested on a real computer: `nvdec` direct, memory, CPU, `gpu_env`, sleep and resume. |
 | Software decoding | Tested in the container. |
 | Intel / AMD (VA-API) | **Not tested.** |
 | Hybrid graphics (Optimus, PRIME) | **Not tested.** `gpu_env` is not applied there by design. |
-| Several monitors | **Not tested** (the code makes one clone per monitor). |
+| Several monitors | Cinnamon: **not tested** (the code makes one clone per monitor). Xfce: tested with two virtual monitors only. |
 | Linux Mint 22.x (Ubuntu base) | **Not tested** on real hardware. |
-| Cinnamon 6.0, 6.2, 6.4, 6.8 | Declared in `metadata.json`; **only 6.6 tested.** |
+| Cinnamon 6.2, 6.4, 6.8 | Declared in `metadata.json`; **not tested** (6.0 and 6.6 are). |
 | Other distributions with Cinnamon | **Not tested.** |
-| Other desktops | **Not supported.** |
+| Other desktops (GNOME, KDE, MATE…) | **Not supported.** |
 | Wayland | **Not supported.** |
 | HiDPI / fractional scaling | **Not tested.** |
 | Translations fr, zh_CN | Work (tested by `--status`); wording not reviewed by native speakers. |
 
-Useful information in a report: distribution and version, `cinnamon --version`,
-`mpv --version | head -1`, graphics card and driver, `mintmotion --status`, the
-mpv PSS and `hwdec-current` (commands in [Memory](#measuring)), and the
-`[mintmotion]` lines of `~/.xsession-errors`.
+Useful information in a report: distribution and version, `cinnamon --version`
+(or `xfwm4 --version` and `xfdesktop --version`), `mpv --version | head -1`,
+graphics card and driver, `mintmotion --status`, the mpv PSS and `hwdec-current`
+(commands in [Memory](#measuring)), and the `[mintmotion]` lines of
+`~/.xsession-errors` (in Xfce, `~/.cache/mintmotion/mintmotion.log`).
 
 ## Limitations and porting notes
 
-- **Cinnamon only.** Placing the video below the desktop icons relies on
-  Cinnamon internals: the background actors (`global.get_background_actors()`
-  in Cinnamon ≥ 6.8, `global.background_actor` before; see
-  `getBackgroundActors()` in `extension.js`), `Main.layoutManager.monitors`,
-  window actors (`get_compositor_private()`), `Clutter.Clone`, and Cinnamon's
-  extension system. Another desktop would need its own way to put a window under
-  the icons; the renderer and the mpv supervision could be reused.
+- **Cinnamon and Xfce only.** In Cinnamon, placing the video below the desktop
+  icons relies on Cinnamon internals: the background actors
+  (`global.get_background_actors()` in Cinnamon ≥ 6.8, `global.background_actor`
+  before; see `getBackgroundActors()` in `extension.js`),
+  `Main.layoutManager.monitors`, window actors (`get_compositor_private()`),
+  `Clutter.Clone`, and Cinnamon's extension system. In Xfce it relies on xfwm4's
+  layers and on xfdesktop's xfconf properties (see
+  [Architecture in Xfce](#architecture-in-xfce)). Most of `mintmotion-xfce` is
+  plain X11 and EWMH, so it is the place to start for another X11 desktop whose
+  file manager draws the icons in a desktop-type window: what is specific to
+  Xfce is how the backdrop is switched to the key colour (`Backdrop` class) and
+  the assumption that a “below” window stays above desktop-type ones.
+- **Xfce: icon layer.** Compared with xfdesktop drawing over the same frame as
+  a static wallpaper, the result differs by at most 1 level out of 255 (rounding)
+  with greyscale text antialiasing. Moving the pointer over an icon makes
+  xfdesktop repaint twice more (white, black) a moment later, and xfconf is
+  written each time. Anything that shows the root pixmap (a pager with
+  wallpaper miniatures) may flash white for an instant.
+- **Xfce: binary cut-out (no compositor).** The mask has one bit per pixel, so the smoothed
+  edges of icons and labels keep the key colour mixed in (a thin dark edge), and
+  soft shadows become hard. A pixel of an icon that happened to be exactly the
+  key colour would show the video.
+- **Xfce: the user's backdrop is replaced while the video is on.** If the
+  supervisor is killed, the desktop shows the key colour (almost black) until it
+  starts again or the video is disabled.
+- **Xfce: one decoder per monitor**, and a resident Python process.
+- **Xfce: translucent windows.** A window with its own transparency (a terminal
+  with a see-through background) counts as covering, so the video behind it is
+  paused. Only `_NET_WM_WINDOW_OPACITY` and xfwm4's inactive-window opacity are
+  taken into account.
 - **X11 only.** The renderer creates an X11 window and mpv draws into it with
   `--wid`. Wayland has no equivalent.
 - **Debian package only.** Other distributions would need their own packaging;
@@ -405,12 +629,16 @@ mpv PSS and `hwdec-current` (commands in [Memory](#measuring)), and the
   bundled.
 - **Uninstall from the window** uses `pkexec apt-get purge`, so it only works
   for the Debian package. For source installs it shows the `make uninstall`
-  command.
+  command. `make uninstall` does not stop a running Xfce supervisor: run
+  `mintmotion --disable` first.
 
 ## Ideas for future work
 
 - Measure and document Intel and AMD (VA-API) results.
 - Test several monitors and HiDPI.
+- Xfce on real hardware (hardware decoding, real monitors), Xfce 4.20.
+- Xfce: a lighter supervisor (it is 22–23 MB of Python), or a single decoder for
+  several monitors.
 - Look into the NVIDIA driver's 154 MB (`--hwdec-extra-frames`,
   `--swapchain-depth`), measuring dropped frames.
 - A playlist or a different video per monitor.
@@ -418,6 +646,15 @@ mpv PSS and `hwdec-current` (commands in [Memory](#measuring)), and the
 
 ## Version history
 
+- **1.6.0** — Xfce: with a compositor, desktop icons are drawn with their real
+  transparency in an ARGB layer above the video (two captures of xfdesktop,
+  black and white backdrop); the cut-out mask of 1.5.0 remains for sessions
+  without a compositor. Cinnamon is unchanged.
+- **1.5.0** — Xfce support (xfwm4 + xfdesktop, Xfce 4.18): supervisor
+  `mintmotion-xfce`, desktop detection in the application, autostart entry,
+  Xfce tests. The application no longer drops the hidden settings keys when it
+  saves. The package depends on `cinnamon | xfdesktop4`. The Cinnamon extension
+  and the renderer are unchanged.
 - **1.4.0** — Interface in English, Spanish, French and Simplified Chinese
   (gettext); English for any other language. Usage bars proportional to the
   value in every theme. Author data. Documentation for developers. Log messages
@@ -437,7 +674,8 @@ mpv PSS and `hwdec-current` (commands in [Memory](#measuring)), and the
   [What is tested and what is not](#what-is-tested-and-what-is-not).
 - Keep changes small and measured: if a change is about memory or CPU, include
   the numbers before and after, taken as described in [Memory](#measuring).
-- Run `tests/smoke-test.sh` before sending a change.
+- Run `tests/smoke-test.sh` (Cinnamon) and `tests/smoke-test-xfce.sh` (Xfce)
+  before sending a change.
 - New user-visible texts go through `_()` and `make update-po`.
 
 Author: José Antonio Ramos Miralles, “Sombra” — <hola@joseantonioramos.es>.

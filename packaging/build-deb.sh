@@ -1,7 +1,7 @@
 #!/bin/bash
 # Genera dist/mintmotion_<versión>_all.deb
 set -euo pipefail
-VERSION="${1:-1.4.0}"
+VERSION="${1:-1.6.0}"
 cd "$(dirname "$0")/.."
 ROOT="build/mintmotion_${VERSION}_all"
 rm -rf "$ROOT"
@@ -11,7 +11,10 @@ mkdir -p "$ROOT/DEBIAN"
 SIZE=$(du -sk "$ROOT/usr" | cut -f1)
 sed -e "s/@VERSION@/$VERSION/" -e "s/@SIZE@/$SIZE/" packaging/control.in > "$ROOT/DEBIAN/control"
 install -m755 packaging/postinst "$ROOT/DEBIAN/postinst"
+install -m755 packaging/prerm "$ROOT/DEBIAN/prerm"
 install -m755 packaging/postrm "$ROOT/DEBIAN/postrm"
+# el arranque automático de Xfce está en /etc: el administrador puede modificarlo
+(cd "$ROOT" && find etc -type f | sed "s#^#/#" | sort) > "$ROOT/DEBIAN/conffiles"
 find "$ROOT" -type d -exec chmod 755 {} +
 mkdir -p dist
 dpkg-deb --root-owner-group --build "$ROOT" "dist/mintmotion_${VERSION}_all.deb" >/dev/null

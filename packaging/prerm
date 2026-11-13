@@ -1,0 +1,15 @@
+#!/bin/sh
+set -e
+# Xfce: al quitar el paquete se cierran los supervisores que estén en marcha
+# (de cualquier usuario) para que devuelvan a xfdesktop el fondo que tenía.
+# Al actualizar no se tocan: siguen hasta que se cierre la sesión.
+SUP='^/usr/bin/python3 /usr/lib/mintmotion/mintmotion-xfce'
+if [ "$1" = "remove" ] && command -v pkill >/dev/null; then
+    if pkill -TERM -f "$SUP" 2>/dev/null; then
+        for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+            pgrep -f "$SUP" >/dev/null 2>&1 || break
+            sleep 0.5
+        done
+    fi
+fi
+exit 0

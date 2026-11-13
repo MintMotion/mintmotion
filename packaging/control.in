@@ -4,18 +4,18 @@ Section: x11
 Priority: optional
 Architecture: all
 Installed-Size: @SIZE@
-Depends: cinnamon (>= 6.0), mpv, python3 (>= 3.9), python3-gi, python3-xlib, gir1.2-gtk-3.0, ffmpeg
-Recommends: mesa-va-drivers, pkexec
+Depends: cinnamon (>= 6.0) | xfdesktop4, mpv, python3 (>= 3.9), python3-gi, python3-xlib, gir1.2-glib-2.0, gir1.2-gtk-3.0, ffmpeg
+Recommends: mesa-va-drivers, pkexec, xfwm4 | cinnamon
 Conflicts: fondo-video
 Replaces: fondo-video
 Maintainer: José Antonio Ramos Miralles (Sombra) <hola@joseantonioramos.es>
 Homepage: https://github.com/MintMotion/mintmotion
-Description: MintMotion - video wallpaper for the Cinnamon desktop
- Plays a video as the desktop background in Linux Mint and LMDE (Cinnamon,
- X11 session), below the desktop icons and all windows, with hardware
- decoding. It pauses by itself when the desktop is fully covered and keeps
- playing while any part of it is visible; if it stays covered for two
- minutes, the player is closed and all its memory is freed.
+Description: MintMotion - video wallpaper for the Cinnamon and Xfce desktops
+ Plays a video as the desktop background in Linux Mint and LMDE (Cinnamon
+ or Xfce, X11 session), below the desktop icons and all windows, with
+ hardware decoding. It pauses by itself when the desktop is fully covered
+ and keeps playing while any part of it is visible; if it stays covered
+ for two minutes, the player is closed and all its memory is freed.
  .
  Includes the "MintMotion" application to choose the video and the options.
  Available in English, Spanish, French and Simplified Chinese.
