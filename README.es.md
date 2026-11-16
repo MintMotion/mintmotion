@@ -53,7 +53,7 @@ del escritorio, los paneles y todas las ventanas. No roba clics ni teclado.
 Con el paquete `.deb`:
 
 ```bash
-sudo apt install ./mintmotion_1.6.0_all.deb
+sudo apt install ./mintmotion_1.7.0_all.deb
 ```
 
 Abre **MintMotion** desde el menú (Preferencias en Cinnamon, Configuración en
@@ -74,6 +74,9 @@ make deb                   # genera dist/mintmotion_<versión>_all.deb
 
 1. **Elegir vídeo…** y ajusta las opciones.
 2. **Aplicar.** No cambia nada hasta que lo pulsas.
+
+El botón **Guía de uso**, arriba en la ventana, abre una guía paso a paso con
+consejos para elegir el vídeo (resolución, formato, bucles sin cortes…).
 
 | Botón | Qué hace |
 |---|---|

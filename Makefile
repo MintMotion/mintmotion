@@ -7,7 +7,7 @@
 #   make update-po           añade a los .po los textos nuevos de la plantilla
 # Necesita gettext (msgfmt) para compilar las traducciones.
 
-VERSION  := 1.6.0
+VERSION  := 1.7.0
 UUID     := mintmotion@sombra
 PREFIX   ?= /usr
 SYSCONFDIR ?= /etc
@@ -19,6 +19,7 @@ EXTDIR   := $(DESTDIR)$(PREFIX)/share/cinnamon/extensions/$(UUID)
 APPDIR   := $(DESTDIR)$(PREFIX)/share/applications
 ICONDIR  := $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
 DOCDIR   := $(DESTDIR)$(PREFIX)/share/doc/mintmotion
+GUIDEDIR := $(DESTDIR)$(PREFIX)/share/mintmotion/guide
 AUTODIR  := $(DESTDIR)$(SYSCONFDIR)/xdg/autostart
 LOCDIR   := $(DESTDIR)$(PREFIX)/share/locale
 LANGS    := $(basename $(notdir $(wildcard po/*.po)))
@@ -51,6 +52,7 @@ install: mo
 	install -Dm644 extension/$(UUID)/metadata.json $(EXTDIR)/metadata.json
 	install -Dm644 data/mintmotion.desktop $(APPDIR)/mintmotion.desktop
 	install -Dm644 data/mintmotion.svg $(ICONDIR)/mintmotion.svg
+	for g in data/guide/guide.*.txt; do install -Dm644 $$g $(GUIDEDIR)/$$(basename $$g); done
 	mkdir -p $(AUTODIR)
 	sed 's#@LIBDIR@#$(PREFIX)/lib/mintmotion#g' data/mintmotion-xfce.desktop.in > $(AUTODIR)/mintmotion-xfce.desktop
 	chmod 644 $(AUTODIR)/mintmotion-xfce.desktop
@@ -65,7 +67,7 @@ uninstall:
 	-pkill -TERM -f '$(PREFIX)/lib/mintmotion/mintmotion-xfce' 2>/dev/null; true
 	rm -f  $(BIN)/mintmotion $(APPDIR)/mintmotion.desktop $(ICONDIR)/mintmotion.svg
 	rm -f  $(AUTODIR)/mintmotion-xfce.desktop
-	rm -rf $(LIBDIR) $(EXTDIR) $(DOCDIR)
+	rm -rf $(LIBDIR) $(EXTDIR) $(DOCDIR) $(DESTDIR)$(PREFIX)/share/mintmotion
 	rm -f $(foreach l,$(LANGS),$(LOCDIR)/$(l)/LC_MESSAGES/mintmotion.mo)
 
 deb:

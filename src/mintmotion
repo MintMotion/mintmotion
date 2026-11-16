@@ -19,6 +19,7 @@ import gettext
 import json
 import locale
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -639,6 +640,83 @@ def human_size(n):
 
 
 # ---------------------------------------------------------------------------
+# Guía de uso (data/guide/guide.<idioma>.txt)
+# ---------------------------------------------------------------------------
+#
+# Formato sencillo, una línea por bloque: «# » título, «## » apartado, «- »
+# viñeta, «1. » paso numerado y párrafos normales. Dentro del texto:
+# **negrita**, `código`, [green] / [yellow] / [red] (punto de color, como en
+# la ventana) y las direcciones https:// se convierten en enlaces.
+
+GUIDE_COLORS = {"green": "#26a269", "yellow": "#e5a50a", "red": "#c01c28"}
+
+
+def guide_language():
+    """Idioma de la guía: el del catálogo de traducciones en uso; si no hay
+    ninguno (inglés o un idioma sin traducción), inglés."""
+    lang = ""
+    try:
+        lang = _T.info().get("language", "")
+    except AttributeError:
+        pass
+    return lang.replace("-", "_") or "en"
+
+
+def guide_path():
+    here = os.path.dirname(os.path.realpath(__file__))
+    dirs = [os.path.join(here, "..", "data", "guide"),               # código fuente
+            os.path.join(here, "..", "share", "mintmotion", "guide"),  # PREFIX=...
+            "/usr/share/mintmotion/guide", "/usr/local/share/mintmotion/guide"]
+    lang = guide_language()
+    for name in (lang, lang.split("_")[0], "en"):
+        for d in dirs:
+            path = os.path.join(d, f"guide.{name}.txt")
+            if os.path.isfile(path):
+                return path
+    return None
+
+
+def _guide_inline(text):
+    from html import escape
+    parts = re.split(r"(`[^`]+`)", text)
+    out = []
+    for part in parts:
+        if part.startswith("`") and part.endswith("`") and len(part) > 1:
+            out.append(f"<tt>{escape(part[1:-1], quote=False)}</tt>")
+            continue
+        t = escape(part, quote=False)
+        t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t)
+        t = re.sub(r"(https://[^\s<]+?)([.,;:)]?(?:\s|$))",
+                   lambda m: f'<a href="{m.group(1)}">{m.group(1)}</a>{m.group(2)}', t)
+        for name, color in GUIDE_COLORS.items():
+            t = t.replace(f"[{name}]", f"<span foreground='{color}'>●</span>")
+        out.append(t)
+    return "".join(out)
+
+
+def guide_blocks(text):
+    """Divide la guía en bloques: [(tipo, marca, marcado de Pango)], con tipo
+    «title», «heading», «item» (viñeta o paso; marca = «•» o el número) o «para»."""
+    blocks = []
+    for line in text.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        if line.startswith("# "):
+            blocks.append(("title", None, _guide_inline(line[2:])))
+        elif line.startswith("## "):
+            blocks.append(("heading", None, _guide_inline(line[3:])))
+        elif line.startswith("- "):
+            blocks.append(("item", "•", _guide_inline(line[2:])))
+        elif re.match(r"\d+\. ", line):
+            n, rest = line.split(" ", 1)
+            blocks.append(("item", n, _guide_inline(rest)))
+        else:
+            blocks.append(("para", None, _guide_inline(line)))
+    return blocks
+
+
+# ---------------------------------------------------------------------------
 # Interfaz gráfica
 # ---------------------------------------------------------------------------
 
@@ -676,6 +754,14 @@ def run_gui():
             header = Gtk.HeaderBar(show_close_button=True, title=APP_NAME,
                                    subtitle=_("Video as desktop background"))
             self.set_titlebar(header)
+            guide_button = Gtk.Button(label=_("User guide"))
+            guide_button.set_image(Gtk.Image.new_from_icon_name("help-browser-symbolic", Gtk.IconSize.BUTTON))
+            guide_button.set_always_show_image(True)
+            guide_button.set_tooltip_text(_("How to use {app} step by step, and tips for choosing "
+                                            "the video.").format(app=APP_NAME))
+            guide_button.connect("clicked", self.on_guide)
+            header.pack_start(guide_button)
+            self.guide_window = None
 
             root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                            margin_start=18, margin_end=18, margin_top=18, margin_bottom=8)
@@ -873,6 +959,54 @@ def run_gui():
             r = d.run()
             d.destroy()
             return r
+
+        def on_guide(self, *_args):
+            if self.guide_window is not None:
+                self.guide_window.present()
+                return
+            path = guide_path()
+            try:
+                with open(path, encoding="utf-8") as f:
+                    blocks = guide_blocks(f.read())
+            except (OSError, TypeError):
+                self.message(_("The user guide was not found."), "", Gtk.MessageType.ERROR)
+                return
+            win = Gtk.Window(title=_("{app} user guide").format(app=APP_NAME), transient_for=self,
+                             destroy_with_parent=True, type_hint=Gdk.WindowTypeHint.DIALOG)
+            win.set_icon_name("mintmotion")
+            win.set_default_size(680, 720)
+            scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                          margin_start=24, margin_end=24, margin_top=18, margin_bottom=24)
+
+            def text_label(mk):
+                lbl = Gtk.Label(use_markup=True, wrap=True, xalign=0, max_width_chars=80,
+                                selectable=True, can_focus=False)
+                lbl.set_markup(mk)
+                return lbl
+
+            for kind, mark, mk in blocks:
+                if kind == "title":
+                    box.pack_start(text_label(f"<span size='x-large' weight='bold'>{mk}</span>"),
+                                   False, False, 0)
+                elif kind == "heading":
+                    lbl = text_label(f"<span size='large' weight='bold'>{mk}</span>")
+                    lbl.set_margin_top(12)
+                    box.pack_start(lbl, False, False, 0)
+                elif kind == "item":
+                    row = Gtk.Box(spacing=8, margin_start=8)
+                    m = Gtk.Label(label=mark, xalign=1, yalign=0,
+                                  width_chars=2)
+                    row.pack_start(m, False, False, 0)
+                    row.pack_start(text_label(mk), True, True, 0)
+                    box.pack_start(row, False, False, 0)
+                else:
+                    box.pack_start(text_label(mk), False, False, 0)
+            scroll.add(box)
+            win.add(scroll)
+            win.connect("destroy", lambda *_a: setattr(self, "guide_window", None))
+            self.guide_window = win
+            win.show_all()
 
         def message(self, title, text="", kind=Gtk.MessageType.INFO):
             d = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,

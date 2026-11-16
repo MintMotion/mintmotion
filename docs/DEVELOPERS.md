@@ -41,7 +41,7 @@ User documentation: [README.md](../README.md) (English) ·
 | `src/mintmotion-renderer` | One-shot helper (Python 3 + python-xlib): creates the X11 window and prints the mpv options, then exits. |
 | `src/mintmotion-xfce` | Xfce supervisor (Python 3 + python-xlib + GLib/Gio): does in Xfce what the extension does in Cinnamon. Stays running while a video is set. |
 | `extension/mintmotion@sombra/` | Cinnamon extension (GJS): starts and supervises mpv and places the video in the background layer. |
-| `data/` | Desktop launcher (translated), icon and the Xfce autostart entry (`mintmotion-xfce.desktop.in`). |
+| `data/` | Desktop launcher (translated), icon, the Xfce autostart entry (`mintmotion-xfce.desktop.in`) and the user guide (`guide/guide.<lang>.txt`). |
 | `po/` | Translation template (`mintmotion.pot`) and catalogs (`es.po`, `fr.po`, `zh_CN.po`). `translations.py` and `make-po.py` were used to create the first catalogs. |
 | `packaging/` | `build-deb.sh`, Debian `control` template, `postinst`, `prerm`, `postrm`. |
 | `tests/` | Cinnamon: Docker image with the LMDE 7 packages, `start-session.sh`, `smoke-test.sh`. Xfce: `Dockerfile.xfce`, `start-session-xfce.sh`, `smoke-test-xfce.sh`, `multimonitor-test-xfce.sh`. |
@@ -438,6 +438,13 @@ Measured with Mint-Y in the test image (green pixels of the filled block in a
   `GenericName`, `Comment` and `Keywords` lines.
 - The extension shows no texts to the user; its `metadata.json` description is
   in English.
+- The user guide (button **User guide**) is not in the catalogs: it is one text
+  file per language, `data/guide/guide.<lang>.txt`, installed in
+  `<prefix>/share/mintmotion/guide/`. The application picks the language of the
+  catalog in use and falls back to `guide.en.txt`. Format, one block per line:
+  `# ` title, `## ` section, `- ` bullet, `1. ` step, plain paragraphs; inline
+  `**bold**`, backquoted code, `[green]`/`[yellow]`/`[red]` status dots, and
+  `https://` links. A new language needs its own guide file.
 
 Workflow:
 
@@ -646,6 +653,8 @@ graphics card and driver, `mintmotion --status`, the mpv PSS and `hwdec-current`
 
 ## Version history
 
+- **1.7.0** — **User guide** button in the window: a step-by-step guide with tips
+  for choosing the video, in English, Spanish, French and Simplified Chinese.
 - **1.6.0** — Xfce: with a compositor, desktop icons are drawn with their real
   transparency in an ARGB layer above the video (two captures of xfdesktop,
   black and white backdrop); the cut-out mask of 1.5.0 remains for sessions

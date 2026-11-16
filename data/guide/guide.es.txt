@@ -1,0 +1,88 @@
+# Guía de uso de MintMotion
+
+## 1. Abrir MintMotion
+
+- **Cinnamon:** Menú → **Preferencias** → **MintMotion**.
+- **Xfce:** Menú → **Configuración** → **MintMotion**.
+
+También puedes escribir «MintMotion» en el buscador del menú.
+
+## 2. Elegir el vídeo
+
+1. Pulsa **Elegir vídeo…**.
+2. Busca el vídeo en tus carpetas (por ejemplo, en Vídeos o Descargas) y pulsa **Abrir**.
+3. Arriba verás una miniatura, y debajo los datos del vídeo: resolución, fotogramas por segundo, formato y duración.
+
+Si debajo aparece en verde **«Ideal para tu pantalla»**, el vídeo ya es perfecto y puedes pasar al paso 4.
+
+## 3. Optimizar el vídeo (recomendado)
+
+Si en lugar del mensaje verde sale **«Se puede optimizar»**, pulsa **Optimizar para mi pantalla**. MintMotion crea una copia del vídeo:
+
+- a la resolución exacta de tu monitor;
+- a 30 fotogramas por segundo como máximo;
+- en formato H.264, el que mejor decodifica cualquier tarjeta gráfica;
+- sin sonido.
+
+Así el fondo se ve lo más nítido posible y gasta lo mínimo. Verás una barra de progreso; tarda más cuanto más largo es el vídeo, y puedes cancelarlo cuando quieras. Al terminar, la copia queda elegida sola.
+
+Tu vídeo original no se toca. Las copias se guardan en la carpeta `~/.local/share/mintmotion/`.
+
+## 4. Ajustar las opciones
+
+- **Ajuste a la pantalla.** **Rellenar** (recomendado): ocupa toda la pantalla y recorta lo que sobra. **Ajustar**: se ve el vídeo entero, con bandas negras si no tiene la misma forma que tu pantalla. **Estirar**: ocupa toda la pantalla, pero puede deformar la imagen.
+- **Calidad de escalado.** Déjala en **Alta**. Solo importa si el vídeo no tiene la resolución de tu pantalla; si lo has optimizado, da igual la que elijas.
+- **Pausar cuando el escritorio queda tapado por completo.** **Actívala.** Cuando una ventana tapa todo el escritorio, el vídeo se pausa y casi no gasta nada. Si sigue tapado 2 minutos, MintMotion libera toda la memoria del reproductor; al volver al escritorio, el vídeo sigue donde estaba.
+- **Decodificación por hardware.** **Actívala.** El vídeo lo decodifica la tarjeta gráfica y el procesador queda casi libre. Desactívala solo si ves la pantalla en negro o imágenes corruptas.
+
+**Optimiza después de elegir el ajuste:** la copia optimizada se crea ya con el ajuste que tengas elegido en ese momento.
+
+## 5. Aplicar
+
+Pulsa **Aplicar**. Hasta que no lo pulses no cambia nada, ni al elegir el vídeo ni al cambiar las opciones. Si cambias algo más tarde, el panel te avisa de que hay cambios sin aplicar.
+
+## 6. Entender el estado
+
+Debajo de las opciones verás un punto de color:
+
+- [green] **Reproduciéndose en el escritorio:** todo va bien.
+- [yellow] **En pausa:** el escritorio está tapado.
+- [yellow] **En reposo:** el escritorio lleva un rato tapado y se ha liberado la memoria. Seguirá al destaparlo.
+- [red] **Arrancando…** o **El reproductor ha fallado:** mira el apartado 10.
+
+Las barras de **CPU** y **RAM** muestran lo que está gastando MintMotion en ese momento.
+
+## 7. Quitar el vídeo o desinstalar
+
+- **Quitar vídeo:** vuelve tu fondo de escritorio de antes. Puedes poner otro vídeo cuando quieras.
+- **Desinstalar…:** borra el programa y su configuración (te pedirá la contraseña). Te pregunta si quieres conservar o borrar las copias optimizadas. Tus vídeos originales nunca se borran.
+
+## 8. Qué vídeo elegir
+
+**Resolución.** Lo ideal es la misma que tu pantalla (por ejemplo, 1920×1080). Un vídeo de más resolución que tu monitor no se ve mejor y hace trabajar más a la tarjeta gráfica y a la memoria. Si es más pequeño, se agranda y pierde nitidez.
+
+**Fotogramas por segundo.** 24, 25 o 30 bastan para un fondo. Un vídeo a 60 fps gasta el doble y en un fondo apenas se nota.
+
+**Formato.** El mejor es **MP4 con H.264**, porque lo decodifica cualquier tarjeta gráfica. También se pueden elegir MKV, WEBM, MOV, AVI y otros; si no son H.264, el botón Optimizar los convierte.
+
+**Duración y tamaño del archivo.** No influyen en la memoria. MintMotion lee el vídeo poco a poco, así que un vídeo de 2 minutos gasta la misma RAM que uno de 10 segundos. Lo que más influye es la **resolución**, y después los **fotogramas por segundo**.
+
+**Sonido.** No hace falta. MintMotion siempre reproduce el vídeo sin sonido.
+
+**Para que el bucle no se note.** El vídeo se repite sin fin. Si el último fotograma es igual o muy parecido al primero, el salto no se ve y parece una animación continua. Los vídeos que se anuncian como «loop» o «seamless loop» ya vienen preparados así. Si el principio y el final son distintos, se verá un pequeño corte en cada vuelta.
+
+**Qué tipo de imagen.** Van mejor los movimientos suaves y continuos, como agua, nubes, partículas, lluvia o paisajes. Los vídeos con cortes de cámara o mucho movimiento distraen más mientras trabajas.
+
+**Dónde encontrarlos.** Hay webs con vídeos gratuitos, como Pexels o Pixabay; busca «loop» junto al tema que te guste. Revisa siempre la licencia de cada vídeo.
+
+## 9. Consejos
+
+- **Si actualizas MintMotion,** cierra la sesión y vuelve a entrar para que se cargue la versión nueva.
+- **En Xfce,** para que los iconos del escritorio se vean perfectos, el compositor tiene que estar activado. Viene así por defecto; lo encontrarás en Ajustes del gestor de ventanas → Compositor.
+- **En un portátil,** con la batería, la pausa automática y la decodificación por hardware ahorran mucho.
+
+## 10. Si algo no funciona
+
+- **No se ve el vídeo:** comprueba que has pulsado **Aplicar** y que estás en una sesión **X11** (Wayland no está soportado).
+- **Pantalla negra o imagen rara:** desactiva **Decodificación por hardware** y pulsa **Aplicar**.
+- **Para pedir ayuda,** abre una incidencia en https://github.com/MintMotion/mintmotion/issues con la salida de `mintmotion --status` en una terminal; tu versión de Linux Mint, tu escritorio (Cinnamon o Xfce) y tu tarjeta gráfica; y el registro del programa: en Xfce, `~/.cache/mintmotion/mintmotion.log`; en Cinnamon, las líneas con `[mintmotion]` de `~/.xsession-errors`.

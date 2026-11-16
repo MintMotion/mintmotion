@@ -1,7 +1,7 @@
 #!/bin/bash
 # Genera dist/mintmotion_<versión>_all.deb
 set -euo pipefail
-VERSION="${1:-1.6.0}"
+VERSION="${1:-1.7.0}"
 cd "$(dirname "$0")/.."
 ROOT="build/mintmotion_${VERSION}_all"
 rm -rf "$ROOT"

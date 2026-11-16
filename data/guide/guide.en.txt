@@ -1,0 +1,88 @@
+# MintMotion user guide
+
+## 1. Open MintMotion
+
+- **Cinnamon:** Menu → **Preferences** → **MintMotion**.
+- **Xfce:** Menu → **Settings** → **MintMotion**.
+
+You can also type “MintMotion” in the menu search box.
+
+## 2. Choose the video
+
+1. Press **Choose video…**.
+2. Find the video in your folders (for example, in Videos or Downloads) and press **Open**.
+3. You will see a thumbnail at the top and, below it, the video details: resolution, frames per second, format and length.
+
+If **“Ideal for your screen”** appears below in green, the video is already perfect and you can go to step 4.
+
+## 3. Optimize the video (recommended)
+
+If instead of the green message it says **“Can be optimized”**, press **Optimize for my screen**. MintMotion makes a copy of the video:
+
+- at the exact resolution of your monitor;
+- at 30 frames per second at most;
+- in H.264 format, the one any graphics card decodes best;
+- without sound.
+
+This way the background looks as sharp as possible and uses as little as possible. You will see a progress bar; the longer the video, the longer it takes, and you can cancel it at any time. When it finishes, the copy is selected automatically.
+
+Your original video is not touched. The copies are saved in the folder `~/.local/share/mintmotion/`.
+
+## 4. Set the options
+
+- **Screen fit.** **Fill** (recommended): covers the whole screen and crops the excess. **Fit**: shows the whole video, with black bars if its shape is different from your screen. **Stretch**: covers the whole screen, but may distort the image.
+- **Scaling quality.** Leave it on **High**. It only matters when the video does not have your screen's resolution; if you optimized it, any choice gives the same result.
+- **Pause when the desktop is fully covered.** **Turn it on.** When a window covers the whole desktop, the video pauses and uses almost nothing. If it stays covered for 2 minutes, MintMotion frees all the player's memory; when you go back to the desktop, the video continues where it was.
+- **Hardware decoding.** **Turn it on.** The graphics card decodes the video and the processor stays almost idle. Turn it off only if you see a black screen or corrupted images.
+
+**Optimize after choosing the fit:** the optimized copy is made with the fit selected at that moment.
+
+## 5. Apply
+
+Press **Apply**. Nothing changes until you press it, neither when you choose the video nor when you change the options. If you change something later, the window tells you there are changes not applied yet.
+
+## 6. Understand the status
+
+Below the options you will see a coloured dot:
+
+- [green] **Playing on the desktop:** everything is fine.
+- [yellow] **Paused:** the desktop is covered.
+- [yellow] **Sleeping:** the desktop has been covered for a while and the memory has been freed. It will continue when uncovered.
+- [red] **Starting…** or **The player has failed:** see section 10.
+
+The **CPU** and **RAM** bars show what MintMotion is using at that moment.
+
+## 7. Remove the video or uninstall
+
+- **Remove video:** your previous desktop background comes back. You can set another video whenever you want.
+- **Uninstall…:** removes the program and its settings (it will ask for your password). It asks whether to keep or delete the optimized copies. Your original videos are never deleted.
+
+## 8. Which video to choose
+
+**Resolution.** Ideally the same as your screen (for example, 1920×1080). A video with a higher resolution than your monitor does not look better and makes the graphics card and the memory work harder. If it is smaller, it is enlarged and loses sharpness.
+
+**Frames per second.** 24, 25 or 30 are enough for a background. A 60 fps video uses twice as much and is hardly noticeable in a background.
+
+**Format.** The best is **MP4 with H.264**, because any graphics card decodes it. MKV, WEBM, MOV, AVI and others can be chosen too; if they are not H.264, the Optimize button converts them.
+
+**Length and file size.** They do not affect memory. MintMotion reads the video little by little, so a 2-minute video uses the same RAM as a 10-second one. What matters most is the **resolution**, and then the **frames per second**.
+
+**Sound.** Not needed. MintMotion always plays the video without sound.
+
+**So that the loop is not noticeable.** The video repeats endlessly. If the last frame is the same as, or very similar to, the first one, the jump cannot be seen and it looks like a continuous animation. Videos advertised as “loop” or “seamless loop” are already made that way. If the beginning and the end are different, a small cut will show on every lap.
+
+**What kind of image.** Smooth, continuous movement works best: water, clouds, particles, rain or landscapes. Videos with camera cuts or a lot of movement are more distracting while you work.
+
+**Where to find them.** There are websites with free videos, such as Pexels or Pixabay; search for “loop” together with the subject you like. Always check each video's license.
+
+## 9. Tips
+
+- **When you update MintMotion,** log out and back in so that the new version is loaded.
+- **In Xfce,** for the desktop icons to look perfect, the compositor must be on. It is on by default; you will find it in Window Manager Tweaks → Compositor.
+- **On a laptop** running on battery, the automatic pause and hardware decoding save a lot.
+
+## 10. If something does not work
+
+- **The video does not show:** check that you pressed **Apply** and that you are in an **X11** session (Wayland is not supported).
+- **Black screen or strange image:** turn off **Hardware decoding** and press **Apply**.
+- **To ask for help,** open an issue at https://github.com/MintMotion/mintmotion/issues with the output of `mintmotion --status` in a terminal; your Linux Mint version, your desktop (Cinnamon or Xfce) and your graphics card; and the program's log: in Xfce, `~/.cache/mintmotion/mintmotion.log`; in Cinnamon, the lines with `[mintmotion]` in `~/.xsession-errors`.

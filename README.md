@@ -53,7 +53,7 @@ the panels and every window. It never takes mouse clicks or keyboard input.
 From the `.deb` package:
 
 ```bash
-sudo apt install ./mintmotion_1.6.0_all.deb
+sudo apt install ./mintmotion_1.7.0_all.deb
 ```
 
 Open **MintMotion** from the menu (Preferences in Cinnamon, Settings in Xfce).
@@ -74,6 +74,9 @@ make deb                   # builds dist/mintmotion_<version>_all.deb
 
 1. **Choose video…** and set the options.
 2. **Apply.** Nothing changes until you press it.
+
+The **User guide** button at the top of the window opens a step-by-step guide,
+with tips for choosing the video (resolution, format, seamless loops…).
 
 | Button | What it does |
 |---|---|
