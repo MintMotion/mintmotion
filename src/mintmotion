@@ -731,7 +731,13 @@ def run_gui():
     # (Mint-Y, Adwaita) dan al tramo relleno un ancho mínimo de 32 px, y así un
     # 0,2 % se veía casi como un 20 %. Se anula solo en estas barras.
     css = Gtk.CssProvider()
-    css.load_from_data(b"levelbar.mintmotion-meter block { min-width: 0; min-height: 0; }")
+    css.load_from_data(b"levelbar.mintmotion-meter block { min-width: 0; min-height: 0; }\n"
+                       # el botón de la guía, con marco: en la barra de título
+                       # muchos temas dibujan los botones planos
+                       b"button.mintmotion-framed { border: 1px solid rgba(128, 128, 128, 0.65);"
+                       b" border-radius: 5px; background-image: none;"
+                       b" background-color: rgba(128, 128, 128, 0.12); }\n"
+                       b"button.mintmotion-framed:hover { background-color: rgba(128, 128, 128, 0.25); }")
     screen = Gdk.Screen.get_default()
     if screen:
         Gtk.StyleContext.add_provider_for_screen(screen, css, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
@@ -757,6 +763,7 @@ def run_gui():
             guide_button = Gtk.Button(label=_("User guide"))
             guide_button.set_image(Gtk.Image.new_from_icon_name("help-browser-symbolic", Gtk.IconSize.BUTTON))
             guide_button.set_always_show_image(True)
+            guide_button.get_style_context().add_class("mintmotion-framed")
             guide_button.set_tooltip_text(_("How to use {app} step by step, and tips for choosing "
                                             "the video.").format(app=APP_NAME))
             guide_button.connect("clicked", self.on_guide)

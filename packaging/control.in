@@ -8,7 +8,7 @@ Depends: cinnamon (>= 6.0) | xfdesktop4, mpv, python3 (>= 3.9), python3-gi, pyth
 Recommends: mesa-va-drivers, pkexec, xfwm4 | cinnamon
 Conflicts: fondo-video
 Replaces: fondo-video
-Maintainer: José Antonio Ramos Miralles (Sombra) <hola@joseantonioramos.es>
+Maintainer: MintMotion by Sombra
 Homepage: https://github.com/MintMotion/mintmotion
 Description: MintMotion - video wallpaper for the Cinnamon and Xfce desktops
  Plays a video as the desktop background in Linux Mint and LMDE (Cinnamon
