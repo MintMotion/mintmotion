@@ -746,7 +746,7 @@ def run_gui():
         def __init__(self, app):
             super().__init__(application=app, title=APP_NAME)
             self.app = app
-            self.set_default_size(560, -1)
+            self._fit_to_screen()
             self.set_icon_name("mintmotion")
             self.applied = load_config()        # lo que está aplicado
             self.cfg = dict(self.applied)       # lo que se está editando
@@ -770,9 +770,30 @@ def run_gui():
             header.pack_start(guide_button)
             self.guide_window = None
 
-            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                           margin_start=18, margin_end=18, margin_top=18, margin_bottom=8)
-            self.add(root)
+            # La ventana se puede maximizar y encoger: el contenido va dentro de
+            # un área con desplazamiento, porque los textos que se ajustan al
+            # ancho (las etiquetas de las opciones) hacen que GTK calcule una
+            # altura mínima enorme si no se le da un ancho. Sin esto la ventana
+            # pedía 1694 px de alto (3466 en una pantalla HiDPI) y el gestor de
+            # ventanas desactivaba «Maximizar» al no caber en la pantalla.
+            outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+            scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroll.set_overlay_scrolling(True)
+            outer.pack_start(scroll, True, True, 0)
+
+            root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                           margin_start=18, margin_end=18, margin_top=14, margin_bottom=8)
+            # Con la ventana maximizada, el formulario no se estira hasta los
+            # bordes: se queda centrado en su ancho natural (el de la columna de
+            # opciones) y los dos huecos laterales se reparten el resto.
+            clamp = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+            root.set_hexpand(False)   # sin esto, las etiquetas de dentro lo hacen expansible
+            clamp.pack_start(Gtk.Box(hexpand=True), True, True, 0)
+            clamp.pack_start(root, False, True, 0)
+            clamp.pack_end(Gtk.Box(hexpand=True), True, True, 0)
+            scroll.add(clamp)
+            self.add(outer)
 
             self.infobar = Gtk.InfoBar(message_type=Gtk.MessageType.WARNING, no_show_all=True)
             self.infobar_label = Gtk.Label(wrap=True, xalign=0)
@@ -781,8 +802,9 @@ def run_gui():
             root.pack_start(self.infobar, False, False, 0)
 
             # Vista previa
-            frame = Gtk.Frame(shadow_type=Gtk.ShadowType.IN)
-            self.preview = Gtk.Image(height_request=270)
+            frame = Gtk.Frame(shadow_type=Gtk.ShadowType.IN, halign=Gtk.Align.CENTER)
+            frame.set_size_request(356, 200)   # mismo hueco con o sin vídeo elegido
+            self.preview = Gtk.Image(height_request=200)
             frame.add(self.preview)
             root.pack_start(frame, False, False, 0)
 
@@ -817,7 +839,7 @@ def run_gui():
             root.pack_start(self.opt_box, False, False, 0)
 
             # Opciones
-            grid = Gtk.Grid(column_spacing=12, row_spacing=10, margin_top=6)
+            grid = Gtk.Grid(column_spacing=12, row_spacing=6, margin_top=4)
             root.pack_start(grid, False, False, 0)
 
             self.fit_combo = self._combo(FITS, self.cfg["fit"])
@@ -837,7 +859,6 @@ def run_gui():
                 grid.attach(widget, 1, i, 1, 1)
 
             self.status = Gtk.Label(xalign=0, use_markup=True, wrap=True, margin_top=6)
-            root.pack_start(self.status, False, False, 0)
 
             # Consumo real del programa frente al total del equipo
             self.meter = UsageMeter()
@@ -871,6 +892,12 @@ def run_gui():
                 text.show()
             root.pack_start(self.usage, False, False, 0)
 
+            # Botones y firma fijos abajo: no se desplazan con el contenido.
+            footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                             margin_start=18, margin_end=18, margin_bottom=8)
+            footer.pack_start(self.status, False, False, 0)
+            outer.pack_end(footer, False, False, 0)
+
             # Botones
             buttons = Gtk.Box(spacing=8, margin_top=8)
             self.uninstall_button = Gtk.Button(label=_("Uninstall…"))
@@ -890,7 +917,7 @@ def run_gui():
             buttons.pack_start(self.uninstall_button, False, False, 0)
             buttons.pack_end(self.apply_button, False, False, 0)
             buttons.pack_end(self.remove_button, False, False, 0)
-            root.pack_start(buttons, False, False, 0)
+            footer.pack_start(buttons, False, False, 0)
 
             # Firma
             credit = Gtk.Label(halign=Gtk.Align.END, use_markup=True)
@@ -898,7 +925,7 @@ def run_gui():
                 _("{app} · by {author}").format(app=APP_NAME, author=AUTHOR)) + "</small>")
             credit.set_tooltip_text(f"{AUTHOR_FULL} «{AUTHOR}» <{AUTHOR_EMAIL}>")
             credit.get_style_context().add_class("dim-label")
-            root.pack_start(credit, False, False, 0)
+            footer.pack_start(credit, False, False, 0)
 
             self.fit_combo.connect("changed", self.on_option_changed)
             self.quality_combo.connect("changed", self.on_option_changed)
@@ -911,6 +938,25 @@ def run_gui():
             self._loading = False
             self.refresh_status()
             self.status_timer = GLib.timeout_add_seconds(2, self.refresh_status)
+
+        def _fit_to_screen(self):
+            """Tamaño inicial que quepa en la pantalla, también con HiDPI.
+
+            El área de trabajo de GdkMonitor ya viene en píxeles lógicos, que
+            es lo que espera set_default_size."""
+            disp = Gdk.Display.get_default()
+            mon = None
+            if disp:
+                mon = disp.get_primary_monitor()
+                if mon is None and disp.get_n_monitors() > 0:
+                    mon = disp.get_monitor(0)
+            if mon is not None:
+                wa = mon.get_workarea()
+                width = min(680, wa.width - 80)
+                height = min(780, wa.height - 16)
+                self.set_default_size(max(width, 480), max(height, 420))
+            else:
+                self.set_default_size(680, 720)
 
         # ----- utilidades -----
 
@@ -1092,7 +1138,7 @@ def run_gui():
                 seek = min(self.info["duration"] * 0.1, 10.0)
             cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-nostdin",
                    "-ss", f"{seek:.2f}", "-i", path, "-frames:v", "1",
-                   "-vf", "scale=480:270:force_original_aspect_ratio=decrease", thumb]
+                   "-vf", "scale=356:200:force_original_aspect_ratio=decrease", thumb]
             try:
                 subprocess.run(cmd, timeout=20, check=True)
                 self.preview.set_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file(thumb))
